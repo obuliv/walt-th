@@ -3,7 +3,9 @@ name = "walt"
 version = "0.1.0"
 description = ""
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "python-dotenv>=1.0",
+]
 
 [build-system]
 requires = ["setuptools>=68"]
