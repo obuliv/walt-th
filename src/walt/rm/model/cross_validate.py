@@ -17,12 +17,13 @@ from pathlib import Path
 from walt.rm.model.base import cross_validate, load_examples, publish_cv_summary
 from walt.rm.model.embeddings import SentenceTransformerEmbedding
 from walt.rm.model.gbm_model import GBMRewardModel
-from walt.rm.model.lr_model import LRRewardModel
+from walt.rm.model.lr_model import SOLVER_BY_PENALTY, LRRewardModel
 from walt.rm.model.lr_model_v2 import LRRewardModelV2
 from walt.rm.model.lr_model_v3 import LRRewardModelV3
+from walt.rm.model.lr_model_v3_scaled import SCALING_CHOICES, LRRewardModelV3Scaled
 from walt.rm.model.tracking import log_run
 
-MODEL_CHOICES = ["lr_v1", "lr_v2", "lr_v3", "gbm"]
+MODEL_CHOICES = ["lr_v1", "lr_v2", "lr_v3", "lr_v3_scaled", "gbm"]
 
 
 def main() -> None:
@@ -34,9 +35,12 @@ def main() -> None:
     parser.add_argument("--embedding-model", default=SentenceTransformerEmbedding.DEFAULT_MODEL_NAME, help="sentence-transformers model name/id")
     parser.add_argument("--device", default=None, help="Torch device for the embedding model")
     parser.add_argument("--C", type=float, default=1.0, help="[lr_v1/lr_v2/lr_v3 only] LogisticRegression inverse regularization strength")
+    parser.add_argument("--penalty", choices=sorted(SOLVER_BY_PENALTY), default="l2", help="[lr_v1/lr_v2/lr_v3/lr_v3_scaled only] LogisticRegression penalty type")
+    parser.add_argument("--l1-ratio", type=float, default=None, help="[penalty=elasticnet only] elastic-net mixing parameter in [0,1] (0=l2, 1=l1)")
     parser.add_argument("--v2-cosine-sim", dest="v2_cosine_sim", action=argparse.BooleanOptionalAction, default=True, help="[lr_v2 only]")
     parser.add_argument("--v2-dot-product", dest="v2_dot_product", action=argparse.BooleanOptionalAction, default=True, help="[lr_v2 only]")
     parser.add_argument("--v2-standardize-dot", dest="v2_standardize_dot", action=argparse.BooleanOptionalAction, default=True, help="[lr_v2 only]")
+    parser.add_argument("--scaling", choices=SCALING_CHOICES, default="none", help="[lr_v3_scaled only] how to scale the embed(sql) block of phi before concatenation")
     parser.add_argument("--gbm-max-iter", type=int, default=200, help="[gbm only] number of boosting rounds")
     parser.add_argument("--gbm-max-depth", type=int, default=None, help="[gbm only] max tree depth (None = sklearn default)")
     parser.add_argument("--gbm-learning-rate", type=float, default=0.1, help="[gbm only]")
@@ -52,18 +56,29 @@ def main() -> None:
 
     def model_factory():
         if args.model == "lr_v1":
-            return LRRewardModel(embedding_provider=embedding_provider, seed=args.seed, C=args.C)
+            return LRRewardModel(embedding_provider=embedding_provider, seed=args.seed, C=args.C, penalty=args.penalty, l1_ratio=args.l1_ratio)
         if args.model == "lr_v2":
             return LRRewardModelV2(
                 embedding_provider=embedding_provider,
                 seed=args.seed,
                 C=args.C,
+                penalty=args.penalty,
+                l1_ratio=args.l1_ratio,
                 use_cosine_sim=args.v2_cosine_sim,
                 use_dot_product=args.v2_dot_product,
                 standardize_dot_product=args.v2_standardize_dot,
             )
         if args.model == "lr_v3":
-            return LRRewardModelV3(embedding_provider=embedding_provider, seed=args.seed, C=args.C)
+            return LRRewardModelV3(embedding_provider=embedding_provider, seed=args.seed, C=args.C, penalty=args.penalty, l1_ratio=args.l1_ratio)
+        if args.model == "lr_v3_scaled":
+            return LRRewardModelV3Scaled(
+                embedding_provider=embedding_provider,
+                seed=args.seed,
+                C=args.C,
+                penalty=args.penalty,
+                l1_ratio=args.l1_ratio,
+                scaling=args.scaling,
+            )
         if args.model == "gbm":
             return GBMRewardModel(
                 embedding_provider=embedding_provider,
@@ -92,11 +107,14 @@ def main() -> None:
                 "k": args.k,
                 "seed": args.seed,
                 "C": args.C,
+                "penalty": args.penalty,
+                "l1_ratio": args.l1_ratio,
                 **(
                     {"v2_cosine_sim": args.v2_cosine_sim, "v2_dot_product": args.v2_dot_product, "v2_standardize_dot": args.v2_standardize_dot}
                     if args.model == "lr_v2"
                     else {}
                 ),
+                **({"scaling": args.scaling} if args.model == "lr_v3_scaled" else {}),
                 **(
                     {"gbm_max_iter": args.gbm_max_iter, "gbm_max_depth": args.gbm_max_depth, "gbm_learning_rate": args.gbm_learning_rate}
                     if args.model == "gbm"

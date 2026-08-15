@@ -32,6 +32,7 @@ are inherited unchanged from LRRewardModel.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Optional
 
 import joblib
 import numpy as np
@@ -48,13 +49,15 @@ class LRRewardModelV2(LRRewardModel):
         embedding_provider: EmbeddingProvider,
         seed: int = 42,
         C: float = 1.0,
+        penalty: str = "l2",
+        l1_ratio: Optional[float] = None,
         use_cosine_sim: bool = True,
         use_dot_product: bool = True,
         standardize_dot_product: bool = True,
     ):
         if not use_cosine_sim and not use_dot_product:
             raise ValueError("LRRewardModelV2 needs at least one of use_cosine_sim/use_dot_product")
-        super().__init__(embedding_provider, seed, C=C)
+        super().__init__(embedding_provider, seed, C=C, penalty=penalty, l1_ratio=l1_ratio)
         self.use_cosine_sim = use_cosine_sim
         self.use_dot_product = use_dot_product
         self.standardize_dot_product = standardize_dot_product
@@ -105,6 +108,8 @@ class LRRewardModelV2(LRRewardModel):
             "coef": self.coef_,
             "seed": self.seed,
             "C": self.C,
+            "penalty": self.penalty,
+            "l1_ratio": self.l1_ratio,
             "embedding_config": self.embedding_provider.config,
             "use_cosine_sim": self.use_cosine_sim,
             "use_dot_product": self.use_dot_product,
@@ -122,6 +127,8 @@ class LRRewardModelV2(LRRewardModel):
             embedding_provider=provider,
             seed=payload["seed"],
             C=payload.get("C", 1.0),
+            penalty=payload.get("penalty", "l2"),
+            l1_ratio=payload.get("l1_ratio"),
             use_cosine_sim=payload["use_cosine_sim"],
             use_dot_product=payload["use_dot_product"],
             standardize_dot_product=payload["standardize_dot_product"],

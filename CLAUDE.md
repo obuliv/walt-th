@@ -204,6 +204,47 @@ that `jina-embeddings-v2-base-code`'s code-specific training (query/code retriev
 alignment) is doing real work here, not just a plausible-sounding default — a generic
 strong text-embedding model isn't a substitute for one that's actually seen code.
 
+**Scaling the `embed(sql)` block of phi doesn't help either — same null-result pattern
+as the dot-product scaling test.** `LRRewardModelV3Scaled` (`lr_model_v3_scaled.py`,
+`--scaling` on `cross_validate.py`) ablates how the ~768-dim `embed(sql)` portion of
+phi is scaled before concatenation with `cosine_sim`/`is_sql_valid`, everything else
+identical to the `lr_v3`/`C=30` baseline. `embed(sql)` is already L2-normalized by the
+embedding provider's default (`normalize=True`), so `scaling="l2_normalize"` is a
+no-op by construction and `scaling="l2_normalize_standardize"` collapses to plain
+`scaling="standardize"` — both still implemented and CV-run rather than assumed, and
+the numbers confirm the equivalence empirically (l2_normalize: top1 0.492±0.013 vs
+baseline 0.494±0.014; l2_normalize_standardize: 0.473±0.016 vs standardize-alone:
+0.470±0.014). The one real result: per-dimension standardizing (sklearn
+`StandardScaler`, fit per CV fold on that fold's training data only) *costs* ~2.3pp
+top1 (0.470 vs 0.494) — outside CV noise, not a fluke. Likely explanation: `C=30` was
+CV-tuned against the raw (unnormalized-per-dimension) embedding scale, and
+standardizing changes which dimensions the L2 penalty effectively favors; if a scaling
+scheme were ever adopted, `C` would need re-tuning, but since nothing here beats the
+unscaled baseline that's moot for now. Net: no scaling variant beats the current
+unscaled baseline — keep `embed(sql)` as-is.
+
+**L1 regularization (vs the default L2) is a promising but unconfirmed lead, not yet a
+win.** `LRRewardModel` (and V2/V3/V3Scaled via inheritance) now take `penalty`/
+`l1_ratio` (`SOLVER_BY_PENALTY = {l2: lbfgs, l1: liblinear, elasticnet: saga}` in
+`lr_model.py`; sklearn requires a non-`lbfgs` solver for L1/elasticnet), exposed as
+`--penalty`/`--l1-ratio` on `cross_validate.py`. Confirmed L1 does genuine feature
+selection first (sklearn 1.8+ emits a `penalty`-is-being-deprecated-in-favor-of-
+`l1_ratio` warning here, but still applies it correctly): a direct fit at `C=30` zeroed
+395/770 coefficients under `penalty=l1` vs 0/770 under `l2`. CV-swept `lr_v3`/`C=30`
+against the `l2` baseline at two seeds — L1 comes out numerically ahead on all 6
+metric comparisons (top1/pairwise/mrr x 2 seeds), a consistent direction, but the
+margin isn't clean: seed=42 shows top1 0.515±0.027 (l1) vs 0.494±0.014 (l2), a gap
+inside roughly one *combined* std since L1's own variance is ~2x L2's there; seed=7
+shows top1 0.509±0.046 (l1) vs 0.498±0.060 (l2), an even smaller gap with both
+penalties noisier (matches the pre-existing seed-7-vs-42 fold-heterogeneity note
+above). Net: not yet a confirmed win — a real, consistently-directional lead worth
+revisiting, not a new baseline. If pursued further, `C` should be re-swept
+specifically for `penalty=l1` (L1's optimal regularization strength isn't guaranteed
+to be the same 30 tuned for L2) — not attempted here to keep this run isolated to
+penalty type alone. The ~50% coefficient sparsity itself could also be a reason to
+prefer L1 independent of the accuracy question (e.g. simpler/faster inference), if
+that becomes a project goal.
+
 `tracking.py` (`log_run`/`load_runs`) is the shared run-logging mechanism any
 `BaseRewardModel` subclass's training script can reuse — not tied to `LRRewardModel`.
 `visualize.py` reads everything under a runs directory and renders a comparison
