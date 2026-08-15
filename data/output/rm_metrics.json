@@ -1,0 +1,23 @@
+{
+  "n_examples": 196,
+  "n_pairs": 980,
+  "top1_accuracy": 0.5459183673469388,
+  "pairwise_accuracy": 0.8642857142857143,
+  "mrr": 0.7380952380952379,
+  "pairwise_accuracy_by_reason": {
+    "inefficient_query": 0.9194630872483222,
+    "syntax_error": 0.8888888888888888,
+    "type_or_null_handling": 0.8571428571428571,
+    "wrong_columns_or_tables": 0.7937219730941704,
+    "wrong_filter_or_sort": 0.8968609865470852,
+    "wrong_join_or_aggregation": 0.8466666666666667
+  },
+  "n_pairs_by_reason": {
+    "inefficient_query": 149,
+    "syntax_error": 144,
+    "type_or_null_handling": 91,
+    "wrong_columns_or_tables": 223,
+    "wrong_filter_or_sort": 223,
+    "wrong_join_or_aggregation": 150
+  }
+}

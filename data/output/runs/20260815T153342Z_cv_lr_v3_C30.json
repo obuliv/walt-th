@@ -1,0 +1,196 @@
+{
+  "run_id": "20260815T153342Z_cv_lr_v3_C30",
+  "timestamp": "20260815T153342Z",
+  "run_name": "cv_lr_v3_C30",
+  "model_class": "LRRewardModelV3",
+  "git_commit": "463110f",
+  "config": {
+    "input": "data/output/rm_enhanced.jsonl",
+    "model": "lr_v3",
+    "embedding_model": "jinaai/jina-embeddings-v2-base-code",
+    "k": 5,
+    "seed": 42,
+    "C": 30.0
+  },
+  "metrics": {
+    "top1_accuracy": 0.49387231815803245,
+    "pairwise_accuracy": 0.8525185943002958,
+    "mrr": 0.7131029129600557,
+    "n_examples": 978
+  },
+  "training": {
+    "cv": {
+      "k": 5,
+      "seed": 42,
+      "folds": [
+        {
+          "n_examples": 196,
+          "n_pairs": 979,
+          "top1_accuracy": 0.5102040816326531,
+          "pairwise_accuracy": 0.8539325842696629,
+          "mrr": 0.7198129251700679,
+          "pairwise_accuracy_by_reason": {
+            "inefficient_query": 0.9096774193548387,
+            "syntax_error": 0.9266666666666666,
+            "type_or_null_handling": 0.8586956521739131,
+            "wrong_columns_or_tables": 0.7819905213270142,
+            "wrong_filter_or_sort": 0.8387096774193549,
+            "wrong_join_or_aggregation": 0.8441558441558441
+          },
+          "n_pairs_by_reason": {
+            "inefficient_query": 155,
+            "syntax_error": 150,
+            "type_or_null_handling": 92,
+            "wrong_columns_or_tables": 211,
+            "wrong_filter_or_sort": 217,
+            "wrong_join_or_aggregation": 154
+          },
+          "fold": 0,
+          "n_train": 782,
+          "n_test": 196
+        },
+        {
+          "n_examples": 196,
+          "n_pairs": 980,
+          "top1_accuracy": 0.49489795918367346,
+          "pairwise_accuracy": 0.8551020408163266,
+          "mrr": 0.7153061224489795,
+          "pairwise_accuracy_by_reason": {
+            "inefficient_query": 0.9276315789473685,
+            "syntax_error": 0.8620689655172413,
+            "type_or_null_handling": 0.9,
+            "wrong_columns_or_tables": 0.7899159663865546,
+            "wrong_filter_or_sort": 0.85,
+            "wrong_join_or_aggregation": 0.8580645161290322
+          },
+          "n_pairs_by_reason": {
+            "inefficient_query": 152,
+            "syntax_error": 145,
+            "type_or_null_handling": 90,
+            "wrong_columns_or_tables": 238,
+            "wrong_filter_or_sort": 200,
+            "wrong_join_or_aggregation": 155
+          },
+          "fold": 1,
+          "n_train": 782,
+          "n_test": 196
+        },
+        {
+          "n_examples": 196,
+          "n_pairs": 980,
+          "top1_accuracy": 0.46938775510204084,
+          "pairwise_accuracy": 0.8561224489795919,
+          "mrr": 0.7062074829931972,
+          "pairwise_accuracy_by_reason": {
+            "inefficient_query": 0.9333333333333333,
+            "syntax_error": 0.8778625954198473,
+            "type_or_null_handling": 0.8021978021978022,
+            "wrong_columns_or_tables": 0.8201754385964912,
+            "wrong_filter_or_sort": 0.8461538461538461,
+            "wrong_join_or_aggregation": 0.8616352201257862
+          },
+          "n_pairs_by_reason": {
+            "inefficient_query": 150,
+            "syntax_error": 131,
+            "type_or_null_handling": 91,
+            "wrong_columns_or_tables": 228,
+            "wrong_filter_or_sort": 221,
+            "wrong_join_or_aggregation": 159
+          },
+          "fold": 2,
+          "n_train": 782,
+          "n_test": 196
+        },
+        {
+          "n_examples": 195,
+          "n_pairs": 975,
+          "top1_accuracy": 0.49230769230769234,
+          "pairwise_accuracy": 0.8471794871794872,
+          "mrr": 0.7078632478632476,
+          "pairwise_accuracy_by_reason": {
+            "inefficient_query": 0.9266666666666666,
+            "syntax_error": 0.8978102189781022,
+            "type_or_null_handling": 0.8617021276595744,
+            "wrong_columns_or_tables": 0.7522522522522522,
+            "wrong_filter_or_sort": 0.8341013824884793,
+            "wrong_join_or_aggregation": 0.8709677419354839
+          },
+          "n_pairs_by_reason": {
+            "inefficient_query": 150,
+            "syntax_error": 137,
+            "type_or_null_handling": 94,
+            "wrong_columns_or_tables": 222,
+            "wrong_filter_or_sort": 217,
+            "wrong_join_or_aggregation": 155
+          },
+          "fold": 3,
+          "n_train": 783,
+          "n_test": 195
+        },
+        {
+          "n_examples": 195,
+          "n_pairs": 975,
+          "top1_accuracy": 0.5025641025641026,
+          "pairwise_accuracy": 0.8502564102564103,
+          "mrr": 0.7163247863247862,
+          "pairwise_accuracy_by_reason": {
+            "inefficient_query": 0.9483870967741935,
+            "syntax_error": 0.8833333333333333,
+            "type_or_null_handling": 0.8247422680412371,
+            "wrong_columns_or_tables": 0.7747747747747747,
+            "wrong_filter_or_sort": 0.8443396226415094,
+            "wrong_join_or_aggregation": 0.8579881656804734
+          },
+          "n_pairs_by_reason": {
+            "inefficient_query": 155,
+            "syntax_error": 120,
+            "type_or_null_handling": 97,
+            "wrong_columns_or_tables": 222,
+            "wrong_filter_or_sort": 212,
+            "wrong_join_or_aggregation": 169
+          },
+          "fold": 4,
+          "n_train": 783,
+          "n_test": 195
+        }
+      ],
+      "summary": {
+        "top1_accuracy": {
+          "mean": 0.49387231815803245,
+          "std": 0.013749672257624293,
+          "values": [
+            0.5102040816326531,
+            0.49489795918367346,
+            0.46938775510204084,
+            0.49230769230769234,
+            0.5025641025641026
+          ]
+        },
+        "pairwise_accuracy": {
+          "mean": 0.8525185943002958,
+          "std": 0.0033252029586184877,
+          "values": [
+            0.8539325842696629,
+            0.8551020408163266,
+            0.8561224489795919,
+            0.8471794871794872,
+            0.8502564102564103
+          ]
+        },
+        "mrr": {
+          "mean": 0.7131029129600557,
+          "std": 0.005201151961700702,
+          "values": [
+            0.7198129251700679,
+            0.7153061224489795,
+            0.7062074829931972,
+            0.7078632478632476,
+            0.7163247863247862
+          ]
+        }
+      }
+    }
+  },
+  "train_metrics": {},
+  "overfitting_gap": {}
+}
