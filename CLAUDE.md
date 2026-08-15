@@ -195,6 +195,15 @@ baseline's 0.424/0.811/0.658), with a modest, expected overfitting gap (~+0.02 t
 up from ~0 at `C=1.0` — less regularization trades a little generalization gap for a
 much better fit, net positive here).
 
+**Embedding model choice matters more than any single feature/hyperparameter change
+tried so far.** CV-swept `lr_v3`/`C=30` against two general-purpose alternatives —
+`BAAI/bge-base-en-v1.5` (top1 0.372) and `sentence-transformers/all-mpnet-base-v2`
+(top1 0.377) — both landed well below `jina-embeddings-v2-base-code`'s 0.494, and
+close to each other despite being different model families. This is decent evidence
+that `jina-embeddings-v2-base-code`'s code-specific training (query/code retrieval
+alignment) is doing real work here, not just a plausible-sounding default — a generic
+strong text-embedding model isn't a substitute for one that's actually seen code.
+
 `tracking.py` (`log_run`/`load_runs`) is the shared run-logging mechanism any
 `BaseRewardModel` subclass's training script can reuse — not tied to `LRRewardModel`.
 `visualize.py` reads everything under a runs directory and renders a comparison
