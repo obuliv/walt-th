@@ -62,7 +62,7 @@ class LRRewardModelV3Scaled(LRRewardModelV3):
             sql_vec = self._scaler.transform(sql_vec.reshape(1, -1))[0]
         return sql_vec
 
-    def _phi(self, question: str, sql: str) -> np.ndarray:
+    def _phi(self, question: str, sql: str, sql_context: tuple[str, ...] = ()) -> np.ndarray:
         q_vec = self._question_cache[question]
         sql_vec = self._sql_cache[sql]
         cos_sim = float(np.dot(q_vec, sql_vec))  # always on the original, unscaled embeddings

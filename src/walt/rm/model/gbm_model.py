@@ -58,10 +58,10 @@ class GBMRewardModel(LRRewardModelV3):
 
         X_rows, y_rows = [], []
         for ex in train_examples:
-            X_rows.append(self._phi(ex.question, ex.sql_good))
+            X_rows.append(self._phi(ex.question, ex.sql_good, ex.sql_context))
             y_rows.append(1)
             for bad in ex.sql_bad:
-                X_rows.append(self._phi(ex.question, bad.sql))
+                X_rows.append(self._phi(ex.question, bad.sql, ex.sql_context))
                 y_rows.append(0)
         X = np.stack(X_rows)
         y = np.array(y_rows)
@@ -92,12 +92,12 @@ class GBMRewardModel(LRRewardModelV3):
             "fit_seconds": round(fit_seconds, 3),
         }
 
-    def score(self, question: str, sql: str) -> float:
+    def score(self, question: str, sql: str, sql_context: tuple[str, ...] = ()) -> float:
         if self.clf is None:
             raise RuntimeError("GBMRewardModel.score() called before fit()/load()")
         self._embed_unique([question], self._question_cache)
         self._embed_unique([sql], self._sql_cache)
-        phi = self._phi(question, sql).reshape(1, -1)
+        phi = self._phi(question, sql, sql_context).reshape(1, -1)
         return float(self.clf.predict_proba(phi)[0, 1])
 
     def save(self, path: str | Path) -> None:

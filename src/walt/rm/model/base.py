@@ -85,9 +85,11 @@ class BaseRewardModel(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def score(self, question: str, sql: str) -> float:
+    def score(self, question: str, sql: str, sql_context: tuple[str, ...] = ()) -> float:
         """Higher = more likely correct. Not assumed to be calibrated/probabilistic —
-        only relative order across candidates for the same question is meaningful."""
+        only relative order across candidates for the same question is meaningful.
+        sql_context (the schema sql executes against) is optional context most
+        subclasses ignore — only context-aware variants (lr_model_context.py) use it."""
         raise NotImplementedError
 
     def predict_error_code(self, question: str, sql: str) -> str | None:
@@ -95,8 +97,8 @@ class BaseRewardModel(ABC):
         unsupported."""
         return None
 
-    def rank(self, question: str, candidates: list[str]) -> list[ScoredCandidate]:
-        scored = [(sql, self.score(question, sql)) for sql in candidates]
+    def rank(self, question: str, candidates: list[str], sql_context: tuple[str, ...] = ()) -> list[ScoredCandidate]:
+        scored = [(sql, self.score(question, sql, sql_context)) for sql in candidates]
         ordered = sorted(scored, key=lambda pair: pair[1], reverse=True)
         return [
             ScoredCandidate(
@@ -118,14 +120,14 @@ class BaseRewardModel(ABC):
         reason_total: dict[str, int] = {}
 
         for ex in test_examples:
-            ranked = self.rank(ex.question, all_candidates(ex))
+            ranked = self.rank(ex.question, all_candidates(ex), ex.sql_context)
             good_rank = next(r.rank for r in ranked if r.sql == ex.sql_good)
             top1_hits += int(good_rank == 1)
             rr_sum += 1.0 / good_rank
 
-            good_score = self.score(ex.question, ex.sql_good)
+            good_score = self.score(ex.question, ex.sql_good, ex.sql_context)
             for bad in ex.sql_bad:
-                bad_score = self.score(ex.question, bad.sql)
+                bad_score = self.score(ex.question, bad.sql, ex.sql_context)
                 pair_total += 1
                 correct = int(good_score > bad_score)
                 pair_correct += correct
@@ -192,24 +194,28 @@ def cross_validate(
     per fold guarantees).
 
     Perf note: if the model exposes an embedding cache (`_question_cache`/`_sql_cache`,
-    as LRRewardModel and its subclasses do), this pre-warms ONE shared copy of it over
+    as LRRewardModel and its subclasses do, plus `_context_cache` for the sql_context-
+    aware variants in lr_model_context.py), this pre-warms ONE shared copy of each over
     the full `examples` set before the fold loop and injects it into every fold's fresh
     model — embedding a given piece of text doesn't depend on which fold it's in, so
     this avoids re-embedding the ~80% of text every fold has in common with every other
     fold (a ~k-fold reduction in embedding calls with no effect on correctness, since
     each fold still fits/evaluates on only its own train/test split)."""
+    CACHE_ATTRS = ("_question_cache", "_sql_cache", "_context_cache")
     warm_model = model_factory()
-    shared_caches = None
-    if hasattr(warm_model, "warm_cache") and hasattr(warm_model, "_question_cache"):
+    cache_attrs = [a for a in CACHE_ATTRS if hasattr(warm_model, a)]
+    shared_caches: dict[str, dict] | None = None
+    if hasattr(warm_model, "warm_cache") and cache_attrs:
         warm_model.warm_cache(examples)
-        shared_caches = (warm_model._question_cache, warm_model._sql_cache)
+        shared_caches = {a: getattr(warm_model, a) for a in cache_attrs}
 
     splits = k_fold_split(examples, k=k, seed=seed)
     fold_metrics = []
     for fold_idx, (train, test) in enumerate(splits):
         model = model_factory()
         if shared_caches is not None:
-            model._question_cache, model._sql_cache = shared_caches
+            for attr, cache in shared_caches.items():
+                setattr(model, attr, cache)
         model.fit(train)
         if hasattr(model, "warm_cache"):
             model.warm_cache(test)

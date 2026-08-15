@@ -202,6 +202,105 @@ def build_user_message(question: str, sql_good: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Bad-only variant: for rows that already carry a verified sql_context (e.g. gretel,
+# see gretel.py), skip sql_good correction and sql_context synthesis entirely and just
+# generate sql_bad negatives against the existing schema.
+# ---------------------------------------------------------------------------
+
+BAD_ONLY_FEW_SHOT_EXAMPLES: list[dict[str, Any]] = [
+    {
+        "question": "What is the total volume of timber sold by each salesperson, sorted by salesperson?",
+        "sql_good": (
+            "SELECT salesperson_id, name, SUM(volume) as total_volume FROM timber_sales "
+            "JOIN salesperson ON timber_sales.salesperson_id = salesperson.salesperson_id "
+            "GROUP BY salesperson_id, name ORDER BY total_volume DESC"
+        ),
+        "sql_context": [
+            "CREATE TABLE salesperson (salesperson_id INTEGER, name TEXT, region TEXT)",
+            "INSERT INTO salesperson (salesperson_id, name, region) VALUES (1, 'John Doe', 'North'), (2, 'Jane Smith', 'South')",
+            "CREATE TABLE timber_sales (sales_id INTEGER, salesperson_id INTEGER, volume REAL, sale_date DATE)",
+            "INSERT INTO timber_sales (sales_id, salesperson_id, volume, sale_date) VALUES (1, 1, 120, '2021-01-01'), (2, 1, 150, '2021-02-01'), (3, 2, 180, '2021-01-01')",
+        ],
+        "response": {
+            "sql_bad": [
+                {
+                    "sql": (
+                        "SELECT salesperson_id, name, SUM(volume) as total_volume FROM timber_sales "
+                        "JOIN salesperson ON timber_sales.salesperson_id = salesperson.salesperson_id "
+                        "GROUP BY salesperson_id"
+                    ),
+                    "reason": "wrong_aggregation",
+                },
+                {
+                    "sql": "SELECT salesperson_id, name, volume FROM timber_sales JOIN salesperson ON timber_sales.salesperson_id = salesperson.salesperson_id",
+                    "reason": "unsafe_patterns",
+                },
+                {
+                    "sql": (
+                        "SELECT salesperson_id, name, SUM(volume) as total_volume FROM timber_sales "
+                        "JOIN salesperson ON timber_sales.sales_id = salesperson.salesperson_id "
+                        "GROUP BY salesperson_id, name ORDER BY total_volume DESC"
+                    ),
+                    "reason": "misjoined_tables",
+                },
+            ],
+        },
+    },
+]
+
+
+def _format_bad_only_few_shot() -> str:
+    blocks = []
+    for i, ex in enumerate(BAD_ONLY_FEW_SHOT_EXAMPLES, 1):
+        blocks.append(
+            f"Example {i}\n"
+            f"Question: {ex['question']}\n"
+            f"sql_good (already correct, do not change): {ex['sql_good']}\n"
+            f"sql_context (already correct, do not change): {json.dumps(ex['sql_context'])}\n"
+            f"Correct tool call input: {json.dumps(ex['response'])}"
+        )
+    return "\n\n".join(blocks)
+
+
+BAD_ONLY_SYSTEM_PROMPT = f"""You are a meticulous SQL reviewer building training data for a text-to-SQL reward model.
+
+For each (question, sql_good, sql_context) triple you are given, `sql_good` is already \
+verified to correctly answer the question against `sql_context` (SQLite CREATE TABLE/ \
+INSERT INTO statements) — do not modify either one, and do not return them.
+
+Produce between 3 and 5 "sql_bad" examples: plausible-looking SQL queries against the \
+same `sql_context` that a competent-but-imperfect model might write for the same \
+question, each containing exactly one meaningful problem. Bad examples must be diverse \
+(no repeated mistake type within the same question) and must be *close misses* that a \
+careless reviewer could mistake for correct — not obviously broken SQL. Every sql_bad \
+query must reference only tables/columns that actually exist in the given sql_context.
+
+Tag each sql_bad example with the single reason category from this list that best \
+explains its mistake:
+
+{_reasons_block()}
+
+Not every category needs to be represented for every question — only use the ones that \
+are natural and plausible for this specific query and schema. Don't force-fit a category \
+just to cover the list; pick whichever 3-5 distinct mistakes a real model would plausibly make here.
+
+# Examples
+
+{_format_bad_only_few_shot()}
+
+Call the `emit_sql_bad` tool exactly once with your result. Do not include any text \
+outside the tool call."""
+
+
+def build_user_message_bad_only(question: str, sql_good: str, sql_context: list[str]) -> str:
+    return (
+        f"Question: {question}\n"
+        f"sql_good (already correct, do not change): {sql_good}\n"
+        f"sql_context (already correct, do not change): {json.dumps(sql_context)}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Tool / JSON schema — this is what forces the model's output into our shape.
 # ---------------------------------------------------------------------------
 
@@ -258,10 +357,39 @@ TOOL_CHOICE = {"type": "tool", "name": TOOL_NAME}
 
 _VALIDATOR = jsonschema.Draft7Validator(RESULT_SCHEMA)
 
+BAD_ONLY_RESULT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "sql_bad": {
+            "type": "array",
+            "minItems": 3,
+            "maxItems": 5,
+            "items": SQL_BAD_ITEM_SCHEMA,
+        },
+    },
+    "required": ["sql_bad"],
+    "additionalProperties": False,
+}
 
-def validate_result(data: dict[str, Any]) -> None:
-    """Raises jsonschema.ValidationError if data doesn't conform to RESULT_SCHEMA."""
-    _VALIDATOR.validate(data)
+BAD_ONLY_TOOL_NAME = "emit_sql_bad"
+
+BAD_ONLY_TOOL_SCHEMA = {
+    "name": BAD_ONLY_TOOL_NAME,
+    "description": "Return a set of labeled incorrect SQL variants for this question, against the given schema.",
+    "input_schema": BAD_ONLY_RESULT_SCHEMA,
+}
+
+BAD_ONLY_TOOL_CHOICE = {"type": "tool", "name": BAD_ONLY_TOOL_NAME}
+
+_BAD_ONLY_VALIDATOR = jsonschema.Draft7Validator(BAD_ONLY_RESULT_SCHEMA)
+
+
+def validate_result(data: dict[str, Any], has_context: bool) -> None:
+    """Raises jsonschema.ValidationError if data doesn't conform to the schema for this
+    record's mode (has_context picks BAD_ONLY_RESULT_SCHEMA vs the full RESULT_SCHEMA —
+    see request_params)."""
+    validator = _BAD_ONLY_VALIDATOR if has_context else _VALIDATOR
+    validator.validate(data)
 
 
 # ---------------------------------------------------------------------------
@@ -291,7 +419,24 @@ def make_custom_id(index: int, total: int) -> str:
     return f"row-{index:0{width}d}"
 
 
-def request_params(question: str, sql_good: str) -> dict[str, Any]:
+def has_context(record: dict[str, Any]) -> bool:
+    """True for rows that already carry a (non-empty) sql_context — e.g. gretel (see
+    gretel.py) — and so should skip sql_good correction / sql_context synthesis and only
+    get sql_bad generated against what's already there."""
+    return bool(record.get("sql_context"))
+
+
+def request_params(record: dict[str, Any]) -> dict[str, Any]:
+    question, sql_good = record["question"], record["sql_good"]
+    if has_context(record):
+        return {
+            "model": ANTHROPIC_MODEL,
+            "max_tokens": 1024,
+            "system": BAD_ONLY_SYSTEM_PROMPT,
+            "tools": [BAD_ONLY_TOOL_SCHEMA],
+            "tool_choice": BAD_ONLY_TOOL_CHOICE,
+            "messages": [{"role": "user", "content": build_user_message_bad_only(question, sql_good, record["sql_context"])}],
+        }
     return {
         "model": ANTHROPIC_MODEL,
         "max_tokens": 2048,
@@ -303,22 +448,41 @@ def request_params(question: str, sql_good: str) -> dict[str, Any]:
 
 
 def extract_tool_input(message: anthropic.types.Message) -> dict[str, Any]:
+    # tool_choice forces exactly one tool call (emit_sql_review or emit_sql_bad,
+    # depending on request_params' mode for this record), so any tool_use block is it.
     for block in message.content:
-        if block.type == "tool_use" and block.name == TOOL_NAME:
+        if block.type == "tool_use":
             return block.input
-    raise ValueError(f"No {TOOL_NAME} tool_use block in response (stop_reason={message.stop_reason!r})")
+    raise ValueError(f"No tool_use block in response (stop_reason={message.stop_reason!r})")
 
 
 def enhance_record(record: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
     merged = dict(record)
-    merged["sql_good"] = result["sql_good"]
     merged["sql_bad"] = result["sql_bad"]
-    merged["sql_context"] = result["sql_context"]
-    # Local verification, no extra API call: does sql_good actually execute against the
-    # context the model just synthesized for it?
-    execution = run_sql(merged["sql_context"], merged["sql_good"])
+    if "sql_good" in result:
+        merged["sql_good"] = result["sql_good"]
+    if "sql_context" in result:
+        merged["sql_context"] = result["sql_context"]
+    # Local verification, no extra API call: does sql_good actually execute against
+    # sql_context (freshly synthesized, or reused as-is when the row already had one)?
+    execution = run_sql(merged.get("sql_context", []), merged["sql_good"])
     merged["sql_context_valid"] = execution.success
     return merged
+
+
+def is_llm_ready(record: dict[str, Any]) -> bool:
+    """False for rows whose sql_context is already known non-executable
+    (sql_context_valid is False — e.g. a gretel row with a wrong-dialect or otherwise
+    broken schema, see gretel.py). In bad-only mode the LLM is instructed not to touch
+    sql_good/sql_context (see BAD_ONLY_SYSTEM_PROMPT), so it can't fix these — spending a
+    call to generate sql_bad against a context that will never execute wastes money for
+    a row evaluate.py will exclude anyway (see its sql_context_valid filter)."""
+    return record.get("sql_context_valid") is not False
+
+
+def filter_llm_ready(records: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+    kept = [r for r in records if is_llm_ready(r)]
+    return kept, len(records) - len(kept)
 
 
 def print_context_summary(records: list[dict[str, Any]]) -> None:
@@ -339,19 +503,23 @@ def print_context_summary(records: list[dict[str, Any]]) -> None:
 
 def cmd_test(args: argparse.Namespace) -> None:
     client = anthropic.Anthropic()
-    records = load_records(args.input)[: args.limit]
+    records, skipped = filter_llm_ready(load_records(args.input))
+    records = records[: args.limit]
+    if skipped:
+        print(f"Skipping {skipped} row(s) with a known-invalid sql_context (no LLM call).")
     if not records:
         print("No records to test.")
         return
 
     results = []
     for i, record in enumerate(records, 1):
-        print(f"[{i}/{len(records)}] {record['question'][:80]}")
-        params = request_params(record["question"], record["sql_good"])
+        mode = "sql_bad-only (context reused)" if has_context(record) else "full"
+        print(f"[{i}/{len(records)}] ({mode}) {record['question'][:80]}")
+        params = request_params(record)
         message = client.messages.create(**params)
         try:
             result = extract_tool_input(message)
-            validate_result(result)
+            validate_result(result, has_context(record))
         except (ValueError, jsonschema.ValidationError) as exc:
             print(f"  FAILED: {exc}")
             continue
@@ -412,9 +580,11 @@ def load_state(batch_id: str) -> dict[str, Any]:
 
 def cmd_submit(args: argparse.Namespace) -> None:
     client = anthropic.Anthropic()
-    records = load_records(args.input)
+    records, skipped = filter_llm_ready(load_records(args.input))
     if args.limit:
         records = records[: args.limit]
+    if skipped:
+        print(f"Skipping {skipped} row(s) with a known-invalid sql_context (no LLM call).")
     if not records:
         print("No records to submit.")
         return
@@ -426,7 +596,7 @@ def cmd_submit(args: argparse.Namespace) -> None:
         requests.append(
             {
                 "custom_id": custom_id,
-                "params": request_params(record["question"], record["sql_good"]),
+                "params": request_params(record),
             }
         )
         records_by_custom_id[custom_id] = record
@@ -436,7 +606,8 @@ def cmd_submit(args: argparse.Namespace) -> None:
     batch = client.messages.batches.create(requests=requests)
     save_state(batch.id, args.input, records_by_custom_id)
 
-    print(f"Submitted batch {batch.id} with {len(requests)} requests (status: {batch.processing_status}).")
+    reused = sum(1 for r in records if has_context(r))
+    print(f"Submitted batch {batch.id} with {len(requests)} requests (status: {batch.processing_status}); {reused}/{len(requests)} reuse an existing sql_context (sql_bad-only).")
     print(f"Collect results later with:\n  python -m walt.rm.data.gen_training_data collect --batch-id {batch.id} --output <path>")
 
 
@@ -479,7 +650,7 @@ def cmd_collect(args: argparse.Namespace) -> None:
 
         try:
             result = extract_tool_input(item.result.message)
-            validate_result(result)
+            validate_result(result, has_context(record))
         except (ValueError, jsonschema.ValidationError) as exc:
             counts["invalid"] += 1
             print(f"  {item.custom_id}: invalid output ({exc})")
@@ -489,8 +660,10 @@ def cmd_collect(args: argparse.Namespace) -> None:
         counts["succeeded"] += 1
 
     write_jsonl(output_records, args.output)
+    reused = sum(1 for r in records_by_custom_id.values() if has_context(r))
     print(f"\nWrote {len(output_records)} enhanced examples to {args.output}")
     print(f"Counts: {counts}")
+    print(f"{reused}/{len(records_by_custom_id)} rows reused an existing sql_context (sql_bad-only).")
     print_context_summary(output_records)
 
 
