@@ -1,0 +1,90 @@
+{
+  "run_id": "20260815T154356Z_lr_v3_C30_baseline",
+  "timestamp": "20260815T154356Z",
+  "run_name": "lr_v3_C30_baseline",
+  "model_class": "LRRewardModelV3",
+  "git_commit": "463110f",
+  "config": {
+    "input": "data/output/rm_enhanced.jsonl",
+    "model": "lr_v3",
+    "embedding_model": "jinaai/jina-embeddings-v2-base-code",
+    "device": null,
+    "test_size": 0.2,
+    "seed": 42,
+    "n_train": 782,
+    "n_test": 196,
+    "n_rows_total": 987,
+    "n_rows_skipped": 9,
+    "C": 30.0
+  },
+  "metrics": {
+    "n_examples": 196,
+    "n_pairs": 980,
+    "top1_accuracy": 0.5459183673469388,
+    "pairwise_accuracy": 0.8642857142857143,
+    "mrr": 0.7380952380952379,
+    "pairwise_accuracy_by_reason": {
+      "inefficient_query": 0.9194630872483222,
+      "syntax_error": 0.8888888888888888,
+      "type_or_null_handling": 0.8571428571428571,
+      "wrong_columns_or_tables": 0.7937219730941704,
+      "wrong_filter_or_sort": 0.8968609865470852,
+      "wrong_join_or_aggregation": 0.8466666666666667
+    },
+    "n_pairs_by_reason": {
+      "inefficient_query": 149,
+      "syntax_error": 144,
+      "type_or_null_handling": 91,
+      "wrong_columns_or_tables": 223,
+      "wrong_filter_or_sort": 223,
+      "wrong_join_or_aggregation": 150
+    }
+  },
+  "training": {
+    "n_train_examples": 782,
+    "n_train_pairs": 3909,
+    "embedding_dim": 768,
+    "feature_dim": 770,
+    "label_balance": {
+      "a_is_good": 1911,
+      "b_is_good": 1998
+    },
+    "lr_C": 30.0,
+    "lr_max_iter": 1000,
+    "lr_n_iter": 55,
+    "lr_converged": true,
+    "embed_seconds": 17.208,
+    "fit_seconds": 0.029,
+    "eval_seconds": 0.121,
+    "train_eval_seconds": 0.024,
+    "total_seconds": 27.547
+  },
+  "train_metrics": {
+    "n_examples": 782,
+    "n_pairs": 3909,
+    "top1_accuracy": 0.571611253196931,
+    "pairwise_accuracy": 0.8848810437452034,
+    "mrr": 0.763917306052856,
+    "pairwise_accuracy_by_reason": {
+      "inefficient_query": 0.9510603588907015,
+      "syntax_error": 0.9053803339517625,
+      "type_or_null_handling": 0.8954423592493298,
+      "wrong_columns_or_tables": 0.8329621380846325,
+      "wrong_filter_or_sort": 0.8578199052132701,
+      "wrong_join_or_aggregation": 0.9065420560747663
+    },
+    "n_pairs_by_reason": {
+      "inefficient_query": 613,
+      "syntax_error": 539,
+      "type_or_null_handling": 373,
+      "wrong_columns_or_tables": 898,
+      "wrong_filter_or_sort": 844,
+      "wrong_join_or_aggregation": 642
+    }
+  },
+  "overfitting_gap": {
+    "top1_accuracy": 0.025692885849992186,
+    "pairwise_accuracy": 0.020595329459489053,
+    "mrr": 0.0258220679576181
+  }
+}

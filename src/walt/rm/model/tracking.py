@@ -32,14 +32,17 @@ def log_run(
     config: dict[str, Any],
     metrics: dict[str, Any],
     training: dict[str, Any] | None = None,
+    train_metrics: dict[str, Any] | None = None,
+    overfitting_gap: dict[str, Any] | None = None,
 ) -> Path:
     """Writes one JSON record for this run into runs_dir, named so runs sort
     chronologically by filename. Returns the written path.
 
+    `metrics` is the held-out test-set evaluate() output — the one visualize.py charts.
     `training` holds fit-time diagnostics (convergence, timing, dataset shape at fit
-    time) that are worth keeping on record for future debugging/comparison even though
-    they're not part of the headline evaluate() metrics and aren't charted by
-    visualize.py."""
+    time). `train_metrics`/`overfitting_gap` (evaluate() on the training set, and the
+    train-minus-test gap on the headline metrics) are recorded for future
+    overfitting checks but, like `training`, aren't charted by visualize.py."""
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     run_id = f"{timestamp}_{run_name}"
     record = {
@@ -51,6 +54,8 @@ def log_run(
         "config": config,
         "metrics": metrics,
         "training": training or {},
+        "train_metrics": train_metrics or {},
+        "overfitting_gap": overfitting_gap or {},
     }
     runs_dir = Path(runs_dir)
     runs_dir.mkdir(parents=True, exist_ok=True)

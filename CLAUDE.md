@@ -51,8 +51,9 @@ uv run python -m walt.rm.data.gen_training_data submit --input data/output/rm_da
 uv run python -m walt.rm.data.gen_training_data collect --batch-id msgbatch_xxx --output data/output/rm_enhanced.jsonl
 ```
 
-Train the pairwise-ranking reward model on `rm_enhanced.jsonl` and evaluate on a
-held-out split:
+Train a pairwise-ranking reward model on `rm_enhanced.jsonl`, evaluate on a held-out
+split, and check the train/test gap for overfitting (`--model` selects `lr_v1`/`lr_v2`/
+`lr_v3`/`gbm`, default `lr_v3` with `--C 30`; see Architecture below for why):
 ```bash
 uv run python -m walt.rm.model.train \
   --input data/output/rm_enhanced.jsonl \
@@ -60,14 +61,25 @@ uv run python -m walt.rm.model.train \
   --metrics-output data/output/rm_metrics.json
 ```
 
+A single 80/20 split is noisy (`--seed 7` vs `--seed 42` alone swung top1_accuracy by
+~1.5pp on `lr_v1`) — before trusting a delta between configs, cross-validate instead:
+```bash
+uv run python -m walt.rm.model.cross_validate --model lr_v3 --C 30
+```
+`cross_validate.py` shares `train.py`'s model/hyperparameter flags, runs k-fold (default
+5) question-level CV, prints mean±std per metric, and logs a run record the same way
+(`metrics` = per-fold means, full per-fold detail under `training.cv`).
+
 Every `train.py` run also logs a JSON record to `data/output/runs/` (override with
 `--run-name`/`--runs-dir`, or skip with `--no-log-run`), so different
 approaches/hyperparameters can be compared later. Each record has `config` (input,
-embedding model, split params, row-skip counts), `metrics` (the headline scores plus a
-`pairwise_accuracy_by_reason` breakdown by mistake category), and `training` (fit-time
-diagnostics: LR convergence, embedding/fit/eval timing, feature dim, label balance) —
-`training`/`by_reason` are recorded for future debugging but deliberately not part of
-what `visualize.py` charts. Compare accumulated runs (prints a table, writes a chart to
+model choice, embedding model, split params, row-skip counts), `metrics` (the headline
+scores plus a `pairwise_accuracy_by_reason` breakdown by mistake category), `training`
+(fit-time diagnostics: LR convergence, embedding/fit/eval timing, feature dim, label
+balance), and `train_metrics`/`overfitting_gap` (evaluate() re-run on the training set,
+and the train-minus-test gap on the headline metrics) — everything except `metrics` is
+recorded for future debugging but deliberately not part of what `visualize.py` charts.
+Compare accumulated runs (prints a table, writes a chart to
 `data/output/runs/comparison.png`):
 ```bash
 uv run python -m walt.rm.model.visualize
@@ -129,7 +141,65 @@ rows where `sql_good` duplicates a `sql_bad` entry (~9/987 rows in the current
 `rm_enhanced.jsonl`, a labeling artifact from the LLM data-generation step) rather than
 aborting the load.
 
+`LRRewardModelV2` (`lr_model_v2.py`) subclasses `LRRewardModel`, overriding only
+`_embed_unique`/`_phi`: V1's `embed()` always L2-normalizes, so its "cosine
+similarity" feature already *is* a dot product (of unit vectors) — V2 fetches raw
+(unnormalized) embeddings instead and adds the raw dot product as a second,
+magnitude-sensitive interaction feature alongside the (now locally-computed) cosine
+similarity (770-dim phi vs V1's 769-dim), with `use_cosine_sim`/`use_dot_product`/
+`standardize_dot_product` constructor flags to ablate each piece. On the real dataset
+none of these combinations beat V1 (confirmed via CV, not just a single split) — the
+raw dot product just isn't informative here, standardized or not.
+
+**Establishing a baseline (CV-driven)**: a naive single 80/20 split is too noisy to
+trust small deltas between configs — `cross_validate.py`'s k-fold CV surfaced two real
+improvements a single split had been masking:
+- **Regularization**: sklearn's default `C=1.0` was substantially under-fitting for
+  this data size (~4700 training pairs, 769 features). Sweeping `C` via CV
+  (`cross_validate.py --model lr_v1 --C ...`) showed top1_accuracy climbing
+  monotonically from 0.246 (`C=0.01`) to ~0.47 (`C=10`-`C=30`, tight ±0.005-0.013 std)
+  before diminishing returns and rising variance set in past `C=100` (early overfitting
+  signal). `C=30` is the sweet spot — `LRRewardModel`/`V2`/`V3` all take `C` as a
+  constructor arg (persisted via `save()`/`load()`), and `train.py`/`cross_validate.py`
+  both default to `--C 30`.
+- **`LRRewardModelV3`** (`lr_model_v3.py`) subclasses `LRRewardModel`, appending one
+  handcrafted feature to V1's phi: `is_sql_valid(sql)` (`sql_features.py`, via
+  `sqlglot` — pure syntax parsing, no schema/database needed). Targeted directly at the
+  `syntax_error` mistake category, which was consistently the weakest or
+  second-weakest in every embedding-only variant's `pairwise_accuracy_by_reason`
+  breakdown (~0.70-0.73). Under CV at `C=30`, V3 beats V1 (top1 0.494 vs 0.469); on the
+  full train.py run this shows up concretely as `syntax_error` accuracy jumping from
+  0.73 to 0.89. Note: sqlglot's default dialect treats a lot of unmodeled DDL/DCL
+  (MySQL's `MODIFY COLUMN`, `GRANT`/`REVOKE`, `RENAME TABLE`, ...) as a lenient
+  `Command` fallback instead of raising — `is_sql_valid` treats that fallback as
+  "invalid too" (catches real mistakes like `GRANT ... FROM` that should be `TO`, at
+  the cost of ~0.7% false positives on genuinely-valid `sql_good` DDL); see the
+  docstring in `sql_features.py` for the recall/false-positive numbers this trades off.
+- **`GBMRewardModel`** (`gbm_model.py`) tries a nonlinear model class instead of more
+  features: `sklearn.ensemble.HistGradientBoostingClassifier`, trained *pointwise*
+  (label = is this candidate `sql_good`, features = `phi(question, sql)` directly, no
+  pairwise differencing) rather than pairwise, because a nonlinear model trained on
+  feature *differences* loses the linear-scorer's clean decompose-into-a-per-candidate-
+  score property (see the module docstring for why that matters for ranking an
+  any-size candidate list). It's a strict feature superset of V3 (same phi) — but loses
+  decisively under CV regardless of hyperparameters tried (default and a shallower/
+  fewer-rounds config both land well below plain `lr_v1`, e.g. top1 ~0.36-0.37 vs
+  0.469). Expected, not a bug: gradient-boosted trees split on individual features one
+  at a time, which doesn't suit dense embedding dimensions where the signal is a
+  weighted combination across all ~768 of them — exactly what a linear model is good at
+  and trees are bad at.
+
+**Current best baseline: `lr_v3` with `C=30`** — `top1_accuracy` 0.546, `pairwise_accuracy`
+0.864, `mrr` 0.738 on the standard 80/20 split (vs the original untuned `lr_v1`
+baseline's 0.424/0.811/0.658), with a modest, expected overfitting gap (~+0.02 to +0.03,
+up from ~0 at `C=1.0` — less regularization trades a little generalization gap for a
+much better fit, net positive here).
+
 `tracking.py` (`log_run`/`load_runs`) is the shared run-logging mechanism any
 `BaseRewardModel` subclass's training script can reuse — not tied to `LRRewardModel`.
 `visualize.py` reads everything under a runs directory and renders a comparison
 table + line chart (top1_accuracy/pairwise_accuracy/mrr per run, chronological).
+`base.py`'s `cross_validate()`/`k_fold_split()` are similarly algorithm-agnostic (take
+a `model_factory` closure) — shares one pre-warmed embedding cache across all folds
+(embedding a string doesn't depend on which fold it's in) rather than re-embedding
+per fold, so k-fold CV costs about the same wall-clock time as a single split.

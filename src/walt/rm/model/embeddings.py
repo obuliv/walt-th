@@ -12,8 +12,10 @@ class EmbeddingProvider(ABC):
     dim: int
 
     @abstractmethod
-    def embed(self, texts: list[str], batch_size: int = 32) -> np.ndarray:
-        """Return an (len(texts), self.dim) float32 array."""
+    def embed(self, texts: list[str], batch_size: int = 32, normalize: bool = True) -> np.ndarray:
+        """Return an (len(texts), self.dim) float32 array. `normalize=False` returns raw
+        (magnitude-preserving) vectors — needed by callers that want an unnormalized dot
+        product, not just cosine similarity."""
         raise NotImplementedError
 
     @property
@@ -42,11 +44,11 @@ class SentenceTransformerEmbedding(EmbeddingProvider):
         self._model.max_seq_length = max_seq_length
         self.dim = self._model.get_embedding_dimension()
 
-    def embed(self, texts: list[str], batch_size: int = 32) -> np.ndarray:
+    def embed(self, texts: list[str], batch_size: int = 32, normalize: bool = True) -> np.ndarray:
         return self._model.encode(
             texts,
             batch_size=batch_size,
-            normalize_embeddings=True,  # so cosine similarity reduces to a dot product downstream
+            normalize_embeddings=normalize,
             convert_to_numpy=True,
             show_progress_bar=False,
         ).astype(np.float32)

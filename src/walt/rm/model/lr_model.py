@@ -27,9 +27,10 @@ from walt.rm.model.embeddings import EmbeddingProvider, build_provider_from_conf
 
 
 class LRRewardModel(BaseRewardModel):
-    def __init__(self, embedding_provider: EmbeddingProvider, seed: int = 42):
+    def __init__(self, embedding_provider: EmbeddingProvider, seed: int = 42, C: float = 1.0):
         self.embedding_provider = embedding_provider
         self.seed = seed
+        self.C = C  # inverse L2 regularization strength (sklearn convention: smaller = more regularization)
         self.coef_: Optional[np.ndarray] = None  # shape (dim + 1,)
         self._question_cache: dict[str, np.ndarray] = {}
         self._sql_cache: dict[str, np.ndarray] = {}
@@ -86,7 +87,7 @@ class LRRewardModel(BaseRewardModel):
 
         max_iter = 1000
         fit_start = time.perf_counter()
-        clf = LogisticRegression(max_iter=max_iter, random_state=self.seed)
+        clf = LogisticRegression(C=self.C, max_iter=max_iter, random_state=self.seed)
         clf.fit(X, y)
         fit_seconds = time.perf_counter() - fit_start
 
@@ -99,6 +100,7 @@ class LRRewardModel(BaseRewardModel):
             "embedding_dim": self.embedding_provider.dim,
             "feature_dim": int(self.coef_.shape[0]),
             "label_balance": {"a_is_good": n_pos, "b_is_good": len(y_rows) - n_pos},
+            "lr_C": self.C,
             "lr_max_iter": max_iter,
             "lr_n_iter": n_iter,
             "lr_converged": n_iter < max_iter,
@@ -118,6 +120,7 @@ class LRRewardModel(BaseRewardModel):
         payload = {
             "coef": self.coef_,
             "seed": self.seed,
+            "C": self.C,
             "embedding_config": self.embedding_provider.config,
         }
         joblib.dump(payload, path)
@@ -126,6 +129,6 @@ class LRRewardModel(BaseRewardModel):
     def load(cls, path: str | Path, embedding_provider: EmbeddingProvider | None = None) -> "LRRewardModel":
         payload = joblib.load(path)
         provider = embedding_provider or build_provider_from_config(payload["embedding_config"])
-        model = cls(embedding_provider=provider, seed=payload["seed"])
+        model = cls(embedding_provider=provider, seed=payload["seed"], C=payload.get("C", 1.0))
         model.coef_ = payload["coef"]
         return model

@@ -1,11 +1,12 @@
 {
-  "run_id": "20260815T150459Z_jina_code_with_diagnostics",
-  "timestamp": "20260815T150459Z",
-  "run_name": "jina_code_with_diagnostics",
+  "run_id": "20260815T151134Z_lr_v1_rerun",
+  "timestamp": "20260815T151134Z",
+  "run_name": "lr_v1_rerun",
   "model_class": "LRRewardModel",
-  "git_commit": "597d5ea",
+  "git_commit": "463110f",
   "config": {
     "input": "data/output/rm_enhanced.jsonl",
+    "model": "lr_v1",
     "embedding_model": "jinaai/jina-embeddings-v2-base-code",
     "device": null,
     "test_size": 0.2,
@@ -50,9 +51,38 @@
     "lr_max_iter": 1000,
     "lr_n_iter": 19,
     "lr_converged": true,
-    "embed_seconds": 17.178,
-    "fit_seconds": 0.02,
-    "eval_seconds": 0.008,
-    "total_seconds": 27.183
+    "embed_seconds": 17.241,
+    "fit_seconds": 0.023,
+    "eval_seconds": 0.006,
+    "train_eval_seconds": 0.022,
+    "total_seconds": 27.389
+  },
+  "train_metrics": {
+    "n_examples": 782,
+    "n_pairs": 3909,
+    "top1_accuracy": 0.4079283887468031,
+    "pairwise_accuracy": 0.8239959068815554,
+    "mrr": 0.662254901960783,
+    "pairwise_accuracy_by_reason": {
+      "inefficient_query": 0.9135399673735726,
+      "syntax_error": 0.7884972170686456,
+      "type_or_null_handling": 0.8498659517426274,
+      "wrong_columns_or_tables": 0.779510022271715,
+      "wrong_filter_or_sort": 0.806872037914692,
+      "wrong_join_or_aggregation": 0.838006230529595
+    },
+    "n_pairs_by_reason": {
+      "inefficient_query": 613,
+      "syntax_error": 539,
+      "type_or_null_handling": 373,
+      "wrong_columns_or_tables": 898,
+      "wrong_filter_or_sort": 844,
+      "wrong_join_or_aggregation": 642
+    }
+  },
+  "overfitting_gap": {
+    "top1_accuracy": -0.015540999008298972,
+    "pairwise_accuracy": 0.012771417085637116,
+    "mrr": 0.004176670668266436
   }
 }

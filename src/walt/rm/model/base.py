@@ -7,9 +7,11 @@ from __future__ import annotations
 
 import json
 import random
+import statistics
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 from walt.rm.data.base import Example
 
@@ -56,6 +58,17 @@ def group_split(
 
 def all_candidates(example: Example) -> list[str]:
     return [example.sql_good] + [b.sql for b in example.sql_bad]
+
+
+OVERFITTING_METRIC_KEYS = ("top1_accuracy", "pairwise_accuracy", "mrr")
+
+
+def overfitting_gap(train_metrics: dict, test_metrics: dict) -> dict:
+    """train - test for each headline metric. A large positive gap means the model
+    does meaningfully better on data it trained on than on held-out data — the
+    standard overfitting signature. Algorithm-agnostic: works on any two evaluate()
+    outputs, not just LRRewardModel's."""
+    return {k: train_metrics[k] - test_metrics[k] for k in OVERFITTING_METRIC_KEYS}
 
 
 @dataclass(frozen=True)
@@ -152,3 +165,73 @@ class BaseRewardModel(ABC):
             output_path.parent.mkdir(parents=True, exist_ok=True)
             output_path.write_text(json.dumps(metrics, indent=2))
             print(f"Wrote metrics to {output_path}")
+
+
+def k_fold_split(examples: list[Example], k: int = 5, seed: int = 42) -> list[tuple[list[Example], list[Example]]]:
+    """k disjoint question-level folds (round-robin after a seeded shuffle), returned as
+    (train, test) pairs — fold i's test set is fold i, its train set is every other fold."""
+    rng = random.Random(seed)
+    shuffled = list(examples)
+    rng.shuffle(shuffled)
+    folds = [shuffled[i::k] for i in range(k)]
+    return [
+        ([ex for j, fold in enumerate(folds) if j != i for ex in fold], folds[i])
+        for i in range(k)
+    ]
+
+
+def cross_validate(
+    model_factory: Callable[[], "BaseRewardModel"], examples: list[Example], k: int = 5, seed: int = 42
+) -> dict:
+    """Runs k-fold cross-validation and returns per-fold metrics plus mean/std across
+    folds for the headline metrics. `model_factory()` must return a fresh, unfit model
+    each call (a closure over a shared, already-loaded EmbeddingProvider is fine and
+    recommended — the provider itself is stateless text-to-vector, so sharing it across
+    folds has no leakage risk; only the model's own train-set-derived state, e.g. LR
+    weights or V2's dot-product mean/std, must be fold-specific, which a fresh instance
+    per fold guarantees).
+
+    Perf note: if the model exposes an embedding cache (`_question_cache`/`_sql_cache`,
+    as LRRewardModel and its subclasses do), this pre-warms ONE shared copy of it over
+    the full `examples` set before the fold loop and injects it into every fold's fresh
+    model — embedding a given piece of text doesn't depend on which fold it's in, so
+    this avoids re-embedding the ~80% of text every fold has in common with every other
+    fold (a ~k-fold reduction in embedding calls with no effect on correctness, since
+    each fold still fits/evaluates on only its own train/test split)."""
+    warm_model = model_factory()
+    shared_caches = None
+    if hasattr(warm_model, "warm_cache") and hasattr(warm_model, "_question_cache"):
+        warm_model.warm_cache(examples)
+        shared_caches = (warm_model._question_cache, warm_model._sql_cache)
+
+    splits = k_fold_split(examples, k=k, seed=seed)
+    fold_metrics = []
+    for fold_idx, (train, test) in enumerate(splits):
+        model = model_factory()
+        if shared_caches is not None:
+            model._question_cache, model._sql_cache = shared_caches
+        model.fit(train)
+        if hasattr(model, "warm_cache"):
+            model.warm_cache(test)
+        metrics = model.evaluate(test)
+        metrics["fold"] = fold_idx
+        metrics["n_train"] = len(train)
+        metrics["n_test"] = len(test)
+        fold_metrics.append(metrics)
+
+    summary = {}
+    for key in OVERFITTING_METRIC_KEYS:
+        values = [m[key] for m in fold_metrics]
+        summary[key] = {
+            "mean": statistics.mean(values),
+            "std": statistics.pstdev(values),
+            "values": values,
+        }
+    return {"k": k, "seed": seed, "folds": fold_metrics, "summary": summary}
+
+
+def publish_cv_summary(cv_result: dict) -> None:
+    print(f"{cv_result['k']}-fold cross-validation:")
+    for key, stats in cv_result["summary"].items():
+        values = ", ".join(f"{v:.4f}" for v in stats["values"])
+        print(f"  {key}: {stats['mean']:.4f} +/- {stats['std']:.4f}  (folds: {values})")

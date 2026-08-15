@@ -1,0 +1,196 @@
+{
+  "run_id": "20260815T153303Z_cv_lr_v1_C300.0",
+  "timestamp": "20260815T153303Z",
+  "run_name": "cv_lr_v1_C300.0",
+  "model_class": "LRRewardModel",
+  "git_commit": "463110f",
+  "config": {
+    "input": "data/output/rm_enhanced.jsonl",
+    "model": "lr_v1",
+    "embedding_model": "jinaai/jina-embeddings-v2-base-code",
+    "k": 5,
+    "seed": 42,
+    "C": 300.0
+  },
+  "metrics": {
+    "top1_accuracy": 0.4867608581894296,
+    "pairwise_accuracy": 0.8517179791850739,
+    "mrr": 0.709777428920286,
+    "n_examples": 978
+  },
+  "training": {
+    "cv": {
+      "k": 5,
+      "seed": 42,
+      "folds": [
+        {
+          "n_examples": 196,
+          "n_pairs": 979,
+          "top1_accuracy": 0.45918367346938777,
+          "pairwise_accuracy": 0.8386108273748724,
+          "mrr": 0.6909863945578227,
+          "pairwise_accuracy_by_reason": {
+            "inefficient_query": 0.9096774193548387,
+            "syntax_error": 0.8733333333333333,
+            "type_or_null_handling": 0.8478260869565217,
+            "wrong_columns_or_tables": 0.7819905213270142,
+            "wrong_filter_or_sort": 0.8110599078341014,
+            "wrong_join_or_aggregation": 0.8441558441558441
+          },
+          "n_pairs_by_reason": {
+            "inefficient_query": 155,
+            "syntax_error": 150,
+            "type_or_null_handling": 92,
+            "wrong_columns_or_tables": 211,
+            "wrong_filter_or_sort": 217,
+            "wrong_join_or_aggregation": 154
+          },
+          "fold": 0,
+          "n_train": 782,
+          "n_test": 196
+        },
+        {
+          "n_examples": 196,
+          "n_pairs": 980,
+          "top1_accuracy": 0.4846938775510204,
+          "pairwise_accuracy": 0.8540816326530613,
+          "mrr": 0.7097789115646259,
+          "pairwise_accuracy_by_reason": {
+            "inefficient_query": 0.9342105263157895,
+            "syntax_error": 0.9103448275862069,
+            "type_or_null_handling": 0.8555555555555555,
+            "wrong_columns_or_tables": 0.773109243697479,
+            "wrong_filter_or_sort": 0.855,
+            "wrong_join_or_aggregation": 0.8451612903225807
+          },
+          "n_pairs_by_reason": {
+            "inefficient_query": 152,
+            "syntax_error": 145,
+            "type_or_null_handling": 90,
+            "wrong_columns_or_tables": 238,
+            "wrong_filter_or_sort": 200,
+            "wrong_join_or_aggregation": 155
+          },
+          "fold": 1,
+          "n_train": 782,
+          "n_test": 196
+        },
+        {
+          "n_examples": 196,
+          "n_pairs": 980,
+          "top1_accuracy": 0.4642857142857143,
+          "pairwise_accuracy": 0.85,
+          "mrr": 0.6995748299319728,
+          "pairwise_accuracy_by_reason": {
+            "inefficient_query": 0.92,
+            "syntax_error": 0.8091603053435115,
+            "type_or_null_handling": 0.8461538461538461,
+            "wrong_columns_or_tables": 0.8070175438596491,
+            "wrong_filter_or_sort": 0.8461538461538461,
+            "wrong_join_or_aggregation": 0.8867924528301887
+          },
+          "n_pairs_by_reason": {
+            "inefficient_query": 150,
+            "syntax_error": 131,
+            "type_or_null_handling": 91,
+            "wrong_columns_or_tables": 228,
+            "wrong_filter_or_sort": 221,
+            "wrong_join_or_aggregation": 159
+          },
+          "fold": 2,
+          "n_train": 782,
+          "n_test": 196
+        },
+        {
+          "n_examples": 195,
+          "n_pairs": 975,
+          "top1_accuracy": 0.5230769230769231,
+          "pairwise_accuracy": 0.8605128205128205,
+          "mrr": 0.7289743589743588,
+          "pairwise_accuracy_by_reason": {
+            "inefficient_query": 0.92,
+            "syntax_error": 0.8905109489051095,
+            "type_or_null_handling": 0.8723404255319149,
+            "wrong_columns_or_tables": 0.7702702702702703,
+            "wrong_filter_or_sort": 0.8387096774193549,
+            "wrong_join_or_aggregation": 0.9290322580645162
+          },
+          "n_pairs_by_reason": {
+            "inefficient_query": 150,
+            "syntax_error": 137,
+            "type_or_null_handling": 94,
+            "wrong_columns_or_tables": 222,
+            "wrong_filter_or_sort": 217,
+            "wrong_join_or_aggregation": 155
+          },
+          "fold": 3,
+          "n_train": 783,
+          "n_test": 195
+        },
+        {
+          "n_examples": 195,
+          "n_pairs": 975,
+          "top1_accuracy": 0.5025641025641026,
+          "pairwise_accuracy": 0.8553846153846154,
+          "mrr": 0.7195726495726494,
+          "pairwise_accuracy_by_reason": {
+            "inefficient_query": 0.9419354838709677,
+            "syntax_error": 0.8916666666666667,
+            "type_or_null_handling": 0.8556701030927835,
+            "wrong_columns_or_tables": 0.7612612612612613,
+            "wrong_filter_or_sort": 0.8537735849056604,
+            "wrong_join_or_aggregation": 0.8757396449704142
+          },
+          "n_pairs_by_reason": {
+            "inefficient_query": 155,
+            "syntax_error": 120,
+            "type_or_null_handling": 97,
+            "wrong_columns_or_tables": 222,
+            "wrong_filter_or_sort": 212,
+            "wrong_join_or_aggregation": 169
+          },
+          "fold": 4,
+          "n_train": 783,
+          "n_test": 195
+        }
+      ],
+      "summary": {
+        "top1_accuracy": {
+          "mean": 0.4867608581894296,
+          "std": 0.023826475699162263,
+          "values": [
+            0.45918367346938777,
+            0.4846938775510204,
+            0.4642857142857143,
+            0.5230769230769231,
+            0.5025641025641026
+          ]
+        },
+        "pairwise_accuracy": {
+          "mean": 0.8517179791850739,
+          "std": 0.007363819576453154,
+          "values": [
+            0.8386108273748724,
+            0.8540816326530613,
+            0.85,
+            0.8605128205128205,
+            0.8553846153846154
+          ]
+        },
+        "mrr": {
+          "mean": 0.709777428920286,
+          "std": 0.013576925070540008,
+          "values": [
+            0.6909863945578227,
+            0.7097789115646259,
+            0.6995748299319728,
+            0.7289743589743588,
+            0.7195726495726494
+          ]
+        }
+      }
+    }
+  },
+  "train_metrics": {},
+  "overfitting_gap": {}
+}
