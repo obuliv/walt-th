@@ -6,6 +6,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import os
 import random
@@ -54,7 +55,15 @@ def compute_sample_sizes(sizes: dict[str, int], target_total: int) -> dict[str, 
     return allocated
 
 
-def build_dataset(target_count: int, seed: int = 42) -> list[Example]:
+def build_dataset(target_count: int, seed: int = 42, val_fraction: float = 0.0) -> list[Example]:
+    """Builds the downsampled, shuffled example list and stamps each row with a `split`
+    of "val" (held out) or "trainval" (everything RM training/CV is allowed to see).
+
+    The RM pipeline's train/test boundary is deliberately *not* fixed here — group_split
+    and k_fold_split (rm/model/base.py) re-derive it per run (see CLAUDE.md on why a
+    single fixed split is too noisy to trust). Only the val/trainval boundary is
+    persisted, so val rows are guaranteed invisible to RM training/CV regardless of
+    which seed a later run uses."""
     rng = random.Random(seed)
 
     examples_by_source: dict[str, list[Example]] = {}
@@ -70,7 +79,12 @@ def build_dataset(target_count: int, seed: int = 42) -> list[Example]:
         combined.extend(examples if n >= len(examples) else rng.sample(examples, n))
 
     rng.shuffle(combined)
-    return combined
+
+    n_val = round(len(combined) * val_fraction)
+    return [
+        dataclasses.replace(ex, split="val" if i < n_val else "trainval")
+        for i, ex in enumerate(combined)
+    ]
 
 
 def write_jsonl(examples: list[Example], output_path: Path) -> None:
@@ -85,19 +99,25 @@ def main() -> None:
     parser.add_argument("--target-count", type=int, help="Desired total number of examples across all sources", default=1000)
     parser.add_argument("--output", type=Path, default=Path(DATA_DIR, "output", "rm_data.jsonl"), help="Output JSONL path")
     parser.add_argument("--seed", type=int, default=42, help="Random seed used for sampling and shuffling")
+    parser.add_argument("--val-fraction", type=float, default=0.15, help="Fraction of rows held out as split=val, invisible to RM training/CV")
     args = parser.parse_args()
 
-    examples = build_dataset(args.target_count, seed=args.seed)
+    examples = build_dataset(args.target_count, seed=args.seed, val_fraction=args.val_fraction)
 
     write_jsonl(examples, args.output)
 
     counts: dict[str, int] = {}
+    split_counts: dict[str, int] = {}
     for example in examples:
         counts[example.source] = counts.get(example.source, 0) + 1
+        split_counts[example.split] = split_counts.get(example.split, 0) + 1
 
     print(f"Wrote {len(examples)} examples to {args.output} (target was {args.target_count})")
     for source, count in sorted(counts.items()):
         print(f"  {source}: {count}")
+    print("Split:")
+    for split, count in sorted(split_counts.items()):
+        print(f"  {split}: {count}")
 
 
 if __name__ == "__main__":

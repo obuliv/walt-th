@@ -50,7 +50,12 @@ def main() -> None:
     args = parser.parse_args()
 
     examples = load_examples(args.input)
-    print(f"Loaded {len(examples)} examples, running {args.k}-fold CV with model={args.model}")
+    n_loaded = len(examples)
+    examples = [ex for ex in examples if ex.split != "val"]
+    print(
+        f"Loaded {n_loaded} examples ({n_loaded - len(examples)} val rows excluded), "
+        f"running {args.k}-fold CV with model={args.model}"
+    )
 
     embedding_provider = SentenceTransformerEmbedding(model_name=args.embedding_model, device=args.device)
 
