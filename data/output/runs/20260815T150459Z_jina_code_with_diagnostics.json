@@ -1,0 +1,58 @@
+{
+  "run_id": "20260815T150459Z_jina_code_with_diagnostics",
+  "timestamp": "20260815T150459Z",
+  "run_name": "jina_code_with_diagnostics",
+  "model_class": "LRRewardModel",
+  "git_commit": "597d5ea",
+  "config": {
+    "input": "data/output/rm_enhanced.jsonl",
+    "embedding_model": "jinaai/jina-embeddings-v2-base-code",
+    "device": null,
+    "test_size": 0.2,
+    "seed": 42,
+    "n_train": 782,
+    "n_test": 196,
+    "n_rows_total": 987,
+    "n_rows_skipped": 9
+  },
+  "metrics": {
+    "n_examples": 196,
+    "n_pairs": 980,
+    "top1_accuracy": 0.42346938775510207,
+    "pairwise_accuracy": 0.8112244897959183,
+    "mrr": 0.6580782312925165,
+    "pairwise_accuracy_by_reason": {
+      "inefficient_query": 0.8859060402684564,
+      "syntax_error": 0.7291666666666666,
+      "type_or_null_handling": 0.8131868131868132,
+      "wrong_columns_or_tables": 0.7713004484304933,
+      "wrong_filter_or_sort": 0.8475336322869955,
+      "wrong_join_or_aggregation": 0.82
+    },
+    "n_pairs_by_reason": {
+      "inefficient_query": 149,
+      "syntax_error": 144,
+      "type_or_null_handling": 91,
+      "wrong_columns_or_tables": 223,
+      "wrong_filter_or_sort": 223,
+      "wrong_join_or_aggregation": 150
+    }
+  },
+  "training": {
+    "n_train_examples": 782,
+    "n_train_pairs": 3909,
+    "embedding_dim": 768,
+    "feature_dim": 769,
+    "label_balance": {
+      "a_is_good": 1911,
+      "b_is_good": 1998
+    },
+    "lr_max_iter": 1000,
+    "lr_n_iter": 19,
+    "lr_converged": true,
+    "embed_seconds": 17.178,
+    "fit_seconds": 0.02,
+    "eval_seconds": 0.008,
+    "total_seconds": 27.183
+  }
+}
