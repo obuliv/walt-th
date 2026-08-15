@@ -74,6 +74,7 @@ def build_dataset(target_count: int, seed: int = 42) -> list[Example]:
 
 
 def write_jsonl(examples: list[Example], output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8") as f:
         for example in examples:
             f.write(json.dumps(example.to_dict()) + "\n")
@@ -82,11 +83,12 @@ def write_jsonl(examples: list[Example], output_path: Path) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--target-count", type=int, help="Desired total number of examples across all sources", default=1000)
-    parser.add_argument("--output", type=Path, default=Path("rm_train.jsonl"), help="Output JSONL path")
+    parser.add_argument("--output", type=Path, default=Path(DATA_DIR, "output", "rm_data.jsonl"), help="Output JSONL path")
     parser.add_argument("--seed", type=int, default=42, help="Random seed used for sampling and shuffling")
     args = parser.parse_args()
 
     examples = build_dataset(args.target_count, seed=args.seed)
+
     write_jsonl(examples, args.output)
 
     counts: dict[str, int] = {}
