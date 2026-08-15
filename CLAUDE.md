@@ -9,8 +9,9 @@ question/SQL datasets, standardizes and downsamples them, then uses the
 Anthropic API to correct the SQL and synthesize labeled negative ("sql_bad")
 examples for RM training.
 
-`src/walt/agent/` and `src/walt/eval/` are currently empty placeholder
-packages — no implementation yet.
+`src/walt/agent/` (LLM candidate generation → RM reranking → toy-SQLite execution) and
+`src/walt/eval/` (agent-level evaluation on a held-out val split) are now implemented —
+see Architecture below.
 
 ## Setup
 
@@ -30,16 +31,24 @@ Adding the RM training dependencies (numpy, scikit-learn, sentence-transformers)
 code imports `find_pruneable_heads_and_indices` from `transformers.pytorch_utils`, which
 transformers v5 removed. `uv add "transformers<5"` if this regresses.
 
+The SQL agent (`src/walt/agent/`) requires a local Ollama server with `llama3.2` pulled
+(`ollama pull llama3.2`) — no API key, no network dependency at inference time.
+
 ## Commands
 
 Run modules with `uv run python -m ...` (or activate `.venv` and drop the `uv run`).
 
-Build the standardized/downsampled dataset from all registered sources:
+Build the standardized/downsampled dataset from all registered sources — `--val-fraction`
+(default `0.15`) stamps each row `split="val"` or `"trainval"`; `val` rows are held out
+for agent-level evaluation and never seen by RM training/CV (see Architecture):
 ```bash
-uv run python -m walt.rm.data.pre_process --target-count 5000 --output data/output/rm_data.jsonl
+uv run python -m walt.rm.data.pre_process --target-count 5000 --val-fraction 0.15 --output data/output/rm_data.jsonl
 ```
 
-Generate `sql_bad` negatives and correct `sql_good` via Claude (three modes):
+Generate `sql_bad` negatives, correct `sql_good`, and synthesize an executable SQLite
+`sql_context` via Claude (three modes) — both `test` and `collect` print an aggregate
+`sql_good execution check: N/M passed (...%)` summary so data quality can be judged
+before training on it:
 ```bash
 # iterate on the prompt cheaply, synchronous calls on a few rows
 uv run python -m walt.rm.data.gen_training_data test --input data/output/rm_data.jsonl --limit 3
@@ -85,6 +94,29 @@ Compare accumulated runs (prints a table, writes a chart to
 uv run python -m walt.rm.model.visualize
 ```
 
+Run the SQL agent (LLM candidates → RM rerank → SQLite execution) on one row of a
+`sql_context`-bearing JSONL, or an ad hoc question:
+```bash
+uv run python -m walt.agent.sql_agent --input data/output/rm_enhanced.jsonl --index 0
+uv run python -m walt.agent.sql_agent --question "..." --schema-file schema.sql
+```
+
+Evaluate the agent end-to-end on the held-out `split="val"` rows (RM good-vs-bad
+accuracy, SQL execution pass/fail, end-to-end QA accuracy — each of the latter two
+reported both with RM reranking and without, i.e. just the first LLM candidate). Like
+`train.py`, each run logs a JSON record (via the same `tracking.log_run`/`load_runs`,
+just pointed at a separate `data/output/eval_runs/` — different metric shape than RM
+training runs) so history can be compared later:
+```bash
+uv run python -m walt.eval.evaluate --input data/output/rm_enhanced.jsonl --rm-model data/output/rm_model.joblib
+uv run python -m walt.eval.visualize  # table + comparison.png across logged eval runs
+```
+Both `sql_agent.py` and `evaluate.py` cache generated LLM candidates to
+`data/output/llm_cache.json` by default (`--no-llm-cache` to disable), keyed by
+`(model, question, schema_context)` — re-running `evaluate.py` against a different
+`--rm-model` reuses the cache instead of re-calling Ollama, so RM iteration (and its
+history log) is fast even though LLM generation isn't.
+
 There is no test suite or lint config configured yet (`tests/` is an empty
 package stub, no pytest/ruff/mypy in `pyproject.toml`).
 
@@ -106,14 +138,16 @@ package stub, no pytest/ruff/mypy in `pyproject.toml`).
 
 3. **`gen_training_data.py`** takes that JSONL and, per row, calls Claude
    with a tool-forced schema (`emit_sql_review`) to: (a) correct `sql_good`
-   if it has a bug, and (b) synthesize 3-5 `sql_bad` variants, each tagged
-   with a mistake category from `BAD_SQL_REASONS` (wrong columns/tables,
-   wrong join/aggregation, wrong filter/sort, type/null handling, syntax
-   error, inefficient query). The system prompt + few-shot examples are
-   defined in this file — edit `FEW_SHOT_EXAMPLES` and `BAD_SQL_REASONS`
-   together when tuning quality. Supports `test` (sync, cheap iteration),
-   `submit` (async Message Batch, cheaper at scale), and `collect` (poll +
-   merge) modes; batch state is cached locally in
+   if it has a bug, (b) synthesize 3-5 `sql_bad` variants, each tagged with a
+   mistake category from `BAD_SQL_REASONS` (`missing_filters`,
+   `wrong_aggregation`, `unsafe_patterns`, `misjoined_tables`), and (c)
+   synthesize `sql_context` — SQLite `CREATE TABLE`/`INSERT INTO` statements
+   `sql_good` can actually execute against, verified locally afterward (no
+   extra API call, see "Data regeneration" below). The system prompt + few-shot
+   examples are defined in this file — edit `FEW_SHOT_EXAMPLES` and
+   `BAD_SQL_REASONS` together when tuning quality. Supports `test` (sync,
+   cheap iteration), `submit` (async Message Batch, cheaper at scale), and
+   `collect` (poll + merge) modes; batch state is cached locally in
    `src/walt/rm/data/.batch_state/<batch_id>.json` so `collect` can be
    re-run independently of `submit`.
 
@@ -189,11 +223,37 @@ improvements a single split had been masking:
   weighted combination across all ~768 of them — exactly what a linear model is good at
   and trees are bad at.
 
-**Current best baseline: `lr_v3` with `C=30`** — `top1_accuracy` 0.546, `pairwise_accuracy`
-0.864, `mrr` 0.738 on the standard 80/20 split (vs the original untuned `lr_v1`
-baseline's 0.424/0.811/0.658), with a modest, expected overfitting gap (~+0.02 to +0.03,
-up from ~0 at `C=1.0` — less regularization trades a little generalization gap for a
-much better fit, net positive here).
+**Data regeneration: 4-category `sql_bad` taxonomy + held-out `val` split (2026-08-15).**
+`gen_training_data.py`'s `BAD_SQL_REASONS` was replaced wholesale — the old 6 categories
+(`wrong_columns_or_tables`, `wrong_join_or_aggregation`, `wrong_filter_or_sort`,
+`type_or_null_handling`, `syntax_error`, `inefficient_query`) are gone, replaced by 4:
+`missing_filters`, `wrong_aggregation`, `unsafe_patterns`, `misjoined_tables`. Rows also
+now carry `sql_context` (LLM-synthesized SQLite `CREATE TABLE`/`INSERT INTO` statements
+so `sql_good` is actually executable — empty when `sql_good` is itself DDL) and
+`sql_context_valid` (verified locally via `walt/utils/sql_exec.py`'s `run_sql()`, no
+extra API call). `pre_process.py` also now stamps every row with `split`
+(`"trainval"`/`"val"`, via `--val-fraction`) — `val` is a held-out set for agent-level
+evaluation (see below) that `train.py`/`cross_validate.py` filter out before
+`group_split`/`k_fold_split` ever run, rather than changing how those existing
+train/test-within-`trainval` mechanisms work (a single fixed train/test boundary was
+already shown too noisy to trust — see CV discussion above — so only the val/trainval
+boundary is persisted). Regenerating at the same scale as before (`--target-count 1000`,
+same seed → same underlying question/SQL sample) via Anthropic Message Batch: 980/1000
+rows succeeded (20 rejected — the model occasionally omits the now-required
+`sql_context` field instead of returning an empty array; a minor, unfixed
+prompt-robustness gap, ~2% of rows). Of the 980: 836 `trainval` / 144 `val`, and
+`sql_context_valid` passed for 899/980 (91.7%) — the 4 reason categories are reasonably
+balanced (830-1078 `sql_bad` instances each).
+
+**Current best baseline: `lr_v3` with `C=30`, retrained on the regenerated data above**
+— `top1_accuracy` 0.6587, `pairwise_accuracy` 0.8982, `mrr` 0.8179 on the standard 80/20
+`trainval` split (5-fold CV: 0.6448 ± 0.0303 / 0.8955 ± 0.0097 / 0.8117 ± 0.0165), with a
+moderate overfitting gap (+0.078/+0.028/+0.045 — wider than the ~+0.02-0.03 seen
+pre-regeneration, plausibly just a smaller effective `trainval` pool: 836 rows vs the
+old 978). Not directly comparable to the pre-regeneration numbers (`top1_accuracy`
+0.546, `pairwise_accuracy` 0.864, `mrr` 0.738, vs the original untuned `lr_v1`
+baseline's 0.424/0.811/0.658) — both the `sql_bad` taxonomy and the row set changed,
+not just `C`.
 
 **Embedding model choice matters more than any single feature/hyperparameter change
 tried so far.** CV-swept `lr_v3`/`C=30` against two general-purpose alternatives —
@@ -253,3 +313,70 @@ table + line chart (top1_accuracy/pairwise_accuracy/mrr per run, chronological).
 a `model_factory` closure) — shares one pre-warmed embedding cache across all folds
 (embedding a string doesn't depend on which fold it's in) rather than re-embedding
 per fold, so k-fold CV costs about the same wall-clock time as a single split.
+
+**SQL agent (`src/walt/agent/`)** wires an LLM candidate generator to the RM and a toy
+SQLite executor: `agent/llm/base.py`'s `BaseLLM.generate_candidates(question,
+schema_context, n) -> list[str]` is the swappable interface; `agent/llm/ollama_llm.py`'s
+`OllamaLLM` is the only implementation so far, backed by a local Ollama server. Ollama's
+HTTP API has no beam-search/multi-return (`num_beams`/`n`/`best_of`) parameter, so
+`generate_candidates` makes `n` separate `chat()` calls with varied temperature/seed
+rather than one decode pass — `BaseLLM`'s signature is deliberately backend-agnostic so
+a future `transformers`-based backend with true `num_beams` beam search is a drop-in
+swap for comparison later. `agent/sql_agent.py`'s `SqlAgent.run(question,
+schema_context)` generates candidates, calls `rm.rank()` (the existing
+`BaseRewardModel` method — no new RM code needed) to pick the top-scored one, executes
+it via `walt/utils/sql_exec.py`'s `run_sql()` against a fresh in-memory SQLite DB seeded
+from `schema_context`, and returns an `AgentResult` (`raw_candidates`,
+`scored_candidates`, `best_sql`, `execution`, `final_answer`, and a `critique` field
+that's always `None` — not implemented). `agent/llm/caching_llm.py`'s `CachingLLM`
+wraps any `BaseLLM` with a disk cache (default `data/output/llm_cache.json`) keyed by
+`(model, question, schema_context)` — deliberately *not* keyed by `n`, so a request for
+fewer candidates than cached is served by slicing and only a request for *more*
+triggers a real call — so re-running evaluation against a different RM (retrained,
+different hyperparameters, even a different `BaseRewardModel` subclass) costs zero new
+LLM calls. Enabled by default on both `sql_agent.py`'s CLI and `evaluate.py`
+(`--no-llm-cache` to disable).
+
+**Agent-level evaluation (`src/walt/eval/evaluate.py`)** runs the agent over the
+held-out `split == "val"` rows (never seen by RM training/CV — see above) and reports
+three things: (1) RM accuracy discriminating `sql_good` vs `sql_bad`, via the existing
+`BaseRewardModel.evaluate()` — no new logic; (2) SQL execution pass/fail, and (3)
+end-to-end QA accuracy (row-set match between the agent's executed result and
+`run_sql(sql_context, sql_good)`'s reference result) — both (2) and (3) reported *with*
+RM reranking (the agent's actual top pick) *and* without it (the first generated
+candidate, i.e. what a single-shot call with no RM would produce), reusing the same
+generated candidates for both so the comparison costs no extra LLM calls. Each run logs
+a record to `data/output/eval_runs/` via `rm/model/tracking.py`'s `log_run`/`load_runs`
+(reused as-is — already algorithm-agnostic, not tied to RM training) with a flat
+`metrics` dict (`rm_top1_accuracy`, `sql_pass_rate_with_rm`/`_without_rm`,
+`qa_accuracy_with_rm`/`_without_rm`) so `eval/visualize.py` — the same table+chart
+pattern as `rm/model/visualize.py`, one color per metric group and solid/dashed
+linestyle for with/without RM rather than a 4th color — can track the RM-vs-no-RM gap
+across runs over time.
+
+**Finding: the RM does not transfer to `llama3.2`'s candidate distribution
+(2026-08-15).** On the 144-row val set (123 executable rows, `n_candidates=5`),
+RM-reranked and no-rerank-baseline are *tied* on end-to-end QA accuracy — 70/123
+(56.9%) either way — and the RM's pick actually executes successfully slightly *less*
+often than the naive first-candidate baseline (103/123 vs 107/123). This isn't the RM
+quietly doing nothing: it disagrees with the baseline pick on 69/123 (56%) rows, but
+among those disagreements it's an exact 15-15 split on which pick is actually correct
+(39 ties) — when RM changes the answer, it's a coin flip, not an improvement. Likely
+cause: the RM was trained to discriminate `sql_good` from Claude-*synthesized*
+`sql_bad` negatives (four deliberate, clean mistake categories — see above), a
+different error distribution than `llama3.2`'s actual generation mistakes at
+`temperature=0.8`; the discriminative signal doesn't transfer out-of-distribution. Not
+yet fixed — the natural next step is retraining with `llama3.2`'s own wrong candidates
+folded in as `sql_bad`-style negatives, targeting the mismatch directly instead of
+assuming synthetic negatives generalize.
+
+**Oracle ceiling: 77.2% (95/123), vs 56.9% achieved — most of the gap isn't RM's to
+close.** Among the 5 cached `llama3.2` candidates per val question: 41/123 (33%) rows
+have *all 5* candidates correct (any pick wins, nothing to rerank), 28/123 (23%) have
+*zero* correct candidates (unreachable by any reranker — a `llama3.2`
+generation-quality ceiling, not an RM problem), leaving 54/123 (44%) as the "mixed"
+bucket where selection quality actually matters. In that bucket, current achieved
+(29/54) is barely above the ~26.8/54 a purely random pick would be expected to get by
+chance (weighted by how many of the 5 are correct per row) — confirming the RM has
+~no discriminative signal on `llama3.2`'s candidates specifically, consistent with the
+disagreement finding above.

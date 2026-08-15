@@ -3,8 +3,11 @@ pre_process.py and never seen by RM training/CV — see rm/data/pre_process.py).
 
 Reports three things:
   1. RM accuracy selecting correct SQL among sql_good vs sql_bad (BaseRewardModel.evaluate()).
-  2. SQL execution pass/fail: does the agent's chosen SQL actually run against sql_context?
-  3. End-to-end QA accuracy: does the agent's executed result match sql_good's?
+  2. SQL execution pass/fail and 3. end-to-end QA accuracy, each reported *with* RM
+     reranking (the agent's actual top-ranked pick) and *without* it (the first LLM
+     candidate, i.e. what a single-shot call with no RM would have produced) — using the
+     same generated candidates for both, so this isolates the RM's contribution without
+     doubling the (expensive) LLM calls.
 
 Usage:
     python -m walt.eval.evaluate --input data/output/rm_enhanced.jsonl
@@ -16,12 +19,12 @@ import json
 from pathlib import Path
 from typing import Any
 
-from walt.agent.llm.ollama_llm import OllamaLLM
-from walt.agent.sql_agent import SqlAgent
+from walt.agent.sql_agent import SqlAgent, build_llm
 from walt.rm.data.base import Example
 from walt.rm.model.base import load_examples
 from walt.rm.model.embeddings import SentenceTransformerEmbedding
 from walt.rm.model.lr_model_v3 import LRRewardModelV3
+from walt.rm.model.tracking import log_run
 from walt.utils.sql_exec import ExecutionResult, run_sql
 
 
@@ -31,13 +34,19 @@ def _rows_match(a: ExecutionResult, b: ExecutionResult) -> bool:
     return sorted(a.rows or ()) == sorted(b.rows or ())
 
 
+def _rate(count: int, total: int) -> dict[str, Any]:
+    return {"count": count, "total": total, "rate": count / total if total else None}
+
+
 def evaluate_agent(val_examples: list[Example], agent: SqlAgent) -> dict[str, Any]:
     executable = [ex for ex in val_examples if ex.sql_context]
-    pass_count = 0
     qa_examples = [ex for ex in executable if ex.sql_context_valid]
-    qa_correct = 0
 
-    for ex in executable:
+    rm_pass = base_pass = 0
+    rm_qa = base_qa = 0
+
+    print(f"Running agent over {len(executable)} executable val rows...")
+    for i, ex in enumerate(executable, 1):
         try:
             result = agent.run(ex.question, list(ex.sql_context))
         except RuntimeError as exc:
@@ -47,23 +56,40 @@ def evaluate_agent(val_examples: list[Example], agent: SqlAgent) -> dict[str, An
             # evaluation run.
             print(f"  WARNING: {exc}")
             continue
-        if result.execution.success:
-            pass_count += 1
+
+        # With RM reranking: the agent's actual top-ranked pick (already executed).
+        rm_execution = result.execution
+        # Without RM: the first LLM candidate, i.e. what a single-shot call with no
+        # reranking would have produced. Reuses the candidates already generated for
+        # this row instead of calling the LLM again.
+        baseline_sql = result.raw_candidates[0]
+        base_execution = (
+            rm_execution if baseline_sql == result.best_sql else run_sql(ex.sql_context, baseline_sql)
+        )
+
+        rm_pass += int(rm_execution.success)
+        base_pass += int(base_execution.success)
+
         if ex.sql_context_valid:
             reference = run_sql(ex.sql_context, ex.sql_good)
-            if _rows_match(result.execution, reference):
-                qa_correct += 1
+            rm_qa += int(_rows_match(rm_execution, reference))
+            base_qa += int(_rows_match(base_execution, reference))
+
+        if i % 10 == 0 or i == len(executable):
+            print(
+                f"  [{i}/{len(executable)}] pass so far — with RM: {rm_pass}/{i} "
+                f"({100 * rm_pass / i:.1f}%), without RM: {base_pass}/{i} ({100 * base_pass / i:.1f}%)",
+                flush=True,
+            )
 
     return {
         "sql_pass_rate": {
-            "passed": pass_count,
-            "total": len(executable),
-            "rate": pass_count / len(executable) if executable else None,
+            "with_rm": _rate(rm_pass, len(executable)),
+            "without_rm": _rate(base_pass, len(executable)),
         },
         "qa_accuracy": {
-            "correct": qa_correct,
-            "total": len(qa_examples),
-            "rate": qa_correct / len(qa_examples) if qa_examples else None,
+            "with_rm": _rate(rm_qa, len(qa_examples)),
+            "without_rm": _rate(base_qa, len(qa_examples)),
         },
     }
 
@@ -76,6 +102,11 @@ def main() -> None:
     parser.add_argument("--n-candidates", type=int, default=5)
     parser.add_argument("--limit", type=int, default=None, help="Only evaluate the first N val rows (smoke testing)")
     parser.add_argument("--output", type=Path, default=None, help="Optional path to write the JSON summary")
+    parser.add_argument("--llm-cache", type=Path, default=Path("data/output/llm_cache.json"), help="Cache LLM candidates here, keyed by (question, schema_context) — so re-running with a different --rm-model reuses candidates instead of re-calling the LLM")
+    parser.add_argument("--no-llm-cache", action="store_true", help="Always call the LLM fresh, ignoring/skipping the cache")
+    parser.add_argument("--run-name", default=None, help="Label for this run in the run log (default: derived from --rm-model and --ollama-model)")
+    parser.add_argument("--runs-dir", type=Path, default=Path("data/output/eval_runs"), help="Directory where agent-eval run records are logged for later comparison (separate from RM training's data/output/runs/ — different metric shape)")
+    parser.add_argument("--no-log-run", action="store_true", help="Skip writing a run record (e.g. for throwaway/debug runs)")
     args = parser.parse_args()
 
     examples = load_examples(args.input)
@@ -92,22 +123,63 @@ def main() -> None:
     print("\n1. RM accuracy (sql_good vs sql_bad):")
     rm.publish_metrics(rm_metrics)
 
-    agent = SqlAgent(llm=OllamaLLM(model=args.ollama_model), rm=rm, n_candidates=args.n_candidates)
+    llm_cache_path = None if args.no_llm_cache else args.llm_cache
+    llm = build_llm(args.ollama_model, llm_cache_path)
+    agent = SqlAgent(llm=llm, rm=rm, n_candidates=args.n_candidates)
     agent_metrics = evaluate_agent(val_examples, agent)
 
+    def _print_line(label: str, stats: dict[str, Any]) -> None:
+        rate = f" ({stats['rate']:.1%})" if stats["rate"] is not None else ""
+        print(f"  {label}: {stats['count']}/{stats['total']}{rate}")
+
     sp = agent_metrics["sql_pass_rate"]
-    print("\n2. SQL execution pass/fail:")
-    print(f"  {sp['passed']}/{sp['total']} passed" + (f" ({sp['rate']:.1%})" if sp["rate"] is not None else ""))
+    print("\n2. SQL execution pass/fail (RM reranking vs no reranking):")
+    _print_line("with RM   ", sp["with_rm"])
+    _print_line("without RM", sp["without_rm"])
 
     qa = agent_metrics["qa_accuracy"]
-    print("\n3. End-to-end QA accuracy:")
-    print(f"  {qa['correct']}/{qa['total']} correct" + (f" ({qa['rate']:.1%})" if qa["rate"] is not None else ""))
+    print("\n3. End-to-end QA accuracy (RM reranking vs no reranking):")
+    _print_line("with RM   ", qa["with_rm"])
+    _print_line("without RM", qa["without_rm"])
 
     summary = {"rm_metrics": rm_metrics, **agent_metrics}
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(summary, indent=2))
         print(f"\nWrote summary to {args.output}")
+
+    if not args.no_log_run:
+        run_name = args.run_name or f"{args.rm_model.stem}_{args.ollama_model}"
+        run_path = log_run(
+            args.runs_dir,
+            run_name=run_name,
+            model_class=f"{type(rm).__name__}+{args.ollama_model}",
+            config={
+                "input": str(args.input),
+                "rm_model": str(args.rm_model),
+                "ollama_model": args.ollama_model,
+                "n_candidates": args.n_candidates,
+                "n_val_examples": len(val_examples),
+            },
+            # Flat so a future comparison table/chart can key straight into it, same as
+            # rm/model/visualize.py does for top1_accuracy/pairwise_accuracy/mrr.
+            metrics={
+                "rm_top1_accuracy": rm_metrics["top1_accuracy"],
+                "rm_pairwise_accuracy": rm_metrics["pairwise_accuracy"],
+                "rm_mrr": rm_metrics["mrr"],
+                "sql_pass_rate_with_rm": sp["with_rm"]["rate"],
+                "sql_pass_rate_without_rm": sp["without_rm"]["rate"],
+                "qa_accuracy_with_rm": qa["with_rm"]["rate"],
+                "qa_accuracy_without_rm": qa["without_rm"]["rate"],
+            },
+            training={
+                "n_executable": sp["with_rm"]["total"],
+                "n_qa_examples": qa["with_rm"]["total"],
+                "sql_pass_rate": agent_metrics["sql_pass_rate"],
+                "qa_accuracy": agent_metrics["qa_accuracy"],
+            },
+        )
+        print(f"Logged run to {run_path}")
 
 
 if __name__ == "__main__":

@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from walt.agent.llm.base import BaseLLM
+from walt.agent.llm.caching_llm import CachingLLM
 from walt.agent.llm.ollama_llm import OllamaLLM
 from walt.rm.model.base import BaseRewardModel, ScoredCandidate
 from walt.rm.model.embeddings import SentenceTransformerEmbedding
@@ -25,6 +26,7 @@ from walt.utils.sql_exec import ExecutionResult, run_sql
 @dataclass(frozen=True)
 class AgentResult:
     question: str
+    raw_candidates: list[str]  # LLM output, in generation order, before RM reranking
     scored_candidates: list[ScoredCandidate]
     best_sql: str
     execution: ExecutionResult
@@ -34,6 +36,7 @@ class AgentResult:
     def to_dict(self) -> dict[str, Any]:
         return {
             "question": self.question,
+            "raw_candidates": self.raw_candidates,
             "scored_candidates": [
                 {"sql": c.sql, "score": c.score, "rank": c.rank, "error_code": c.error_code}
                 for c in self.scored_candidates
@@ -79,12 +82,20 @@ class SqlAgent:
         execution = run_sql(schema_context, best.sql)
         return AgentResult(
             question=question,
+            raw_candidates=candidates,
             scored_candidates=scored,
             best_sql=best.sql,
             execution=execution,
             final_answer=_format_answer(execution),
             critique=None,
         )
+
+
+def build_llm(ollama_model: str, llm_cache_path: str | Path | None) -> BaseLLM:
+    llm: BaseLLM = OllamaLLM(model=ollama_model)
+    if llm_cache_path is not None:
+        llm = CachingLLM(llm, cache_path=llm_cache_path)
+    return llm
 
 
 def run_agent(
@@ -94,10 +105,12 @@ def run_agent(
     rm_model_path: str | Path = "data/output/rm_model.joblib",
     ollama_model: str = "llama3.2",
     n_candidates: int = 5,
+    llm_cache_path: str | Path | None = "data/output/llm_cache.json",
 ) -> AgentResult:
     embedding_provider = SentenceTransformerEmbedding()
     rm = LRRewardModelV3.load(rm_model_path, embedding_provider=embedding_provider)
-    agent = SqlAgent(llm=OllamaLLM(model=ollama_model), rm=rm, n_candidates=n_candidates)
+    llm = build_llm(ollama_model, llm_cache_path)
+    agent = SqlAgent(llm=llm, rm=rm, n_candidates=n_candidates)
     return agent.run(question, schema_context)
 
 
@@ -110,6 +123,8 @@ def main() -> None:
     parser.add_argument("--rm-model", type=Path, default=Path("data/output/rm_model.joblib"))
     parser.add_argument("--ollama-model", default="llama3.2")
     parser.add_argument("--n-candidates", type=int, default=5)
+    parser.add_argument("--llm-cache", type=Path, default=Path("data/output/llm_cache.json"), help="Cache LLM candidates here, keyed by (question, schema_context) — reused across RM changes")
+    parser.add_argument("--no-llm-cache", action="store_true", help="Always call the LLM fresh, ignoring/skipping the cache")
     args = parser.parse_args()
 
     if args.input:
@@ -131,6 +146,7 @@ def main() -> None:
         rm_model_path=args.rm_model,
         ollama_model=args.ollama_model,
         n_candidates=args.n_candidates,
+        llm_cache_path=None if args.no_llm_cache else args.llm_cache,
     )
     print(json.dumps(result.to_dict(), indent=2))
 
