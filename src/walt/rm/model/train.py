@@ -52,8 +52,13 @@ def main() -> None:
 
     load_stats: dict = {}
     examples = load_examples(args.input, stats=load_stats)
+    n_loaded = len(examples)
+    examples = [ex for ex in examples if ex.split != "val"]
     train_examples, test_examples = group_split(examples, test_size=args.test_size, seed=args.seed)
-    print(f"Loaded {len(examples)} examples: {len(train_examples)} train / {len(test_examples)} test")
+    print(
+        f"Loaded {n_loaded} examples ({n_loaded - len(examples)} val rows excluded): "
+        f"{len(train_examples)} train / {len(test_examples)} test"
+    )
 
     embedding_provider = SentenceTransformerEmbedding(model_name=args.embedding_model, device=args.device)
     if args.model == "lr_v1":

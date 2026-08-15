@@ -1,10 +1,14 @@
-"""Uses Claude to enhance rm training data: fixes `sql_good` and generates labeled
-`sql_bad` negatives for reward-model training.
+"""Uses Claude to enhance rm training data: fixes `sql_good`, generates labeled
+`sql_bad` negatives, and synthesizes a SQLite `sql_context` (CREATE TABLE/INSERT INTO
+statements) so sql_good can actually be executed, for reward-model training.
 
-Input:  JSONL with {"question", "sql_good", "source"} per line (see pre_process.py).
-Output: JSONL with {"question", "sql_good", "sql_bad", "source"} per line, where
-        sql_good has been corrected if needed and sql_bad is a list of 3-5
-        {"sql", "reason"} negatives.
+Input:  JSONL with {"question", "sql_good", "source", "split"} per line (see pre_process.py).
+Output: JSONL with {"question", "sql_good", "sql_bad", "sql_context", "sql_context_valid",
+        "source", "split"} per line, where sql_good has been corrected if needed,
+        sql_bad is a list of 3-5 {"sql", "reason"} negatives, sql_context is a list of
+        SQLite-compatible CREATE TABLE/INSERT INTO statements sql_good can run against,
+        and sql_context_valid records whether sql_good actually executed successfully
+        against that context (checked locally, no extra API call).
 
 Modes:
     test    - run a handful of rows through synchronous single calls, for iterating
@@ -33,6 +37,8 @@ import anthropic
 import jsonschema
 from dotenv import load_dotenv
 
+from walt.utils.sql_exec import run_sql
+
 load_dotenv()
 
 ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5")
@@ -44,12 +50,10 @@ STATE_DIR = Path(__file__).resolve().parent / ".batch_state"
 # ---------------------------------------------------------------------------
 
 BAD_SQL_REASONS: list[tuple[str, str]] = [
-    ("wrong_columns_or_tables", "Selects, filters, or joins the wrong column(s) or table(s), including ambiguous/unqualified column references."),
-    ("wrong_join_or_aggregation", "Uses an incorrect join type, or the wrong aggregate function/GROUP BY."),
-    ("wrong_filter_or_sort", "Omits or misstates a WHERE/HAVING condition, or gets ORDER BY/LIMIT wrong."),
-    ("type_or_null_handling", "Compares/casts incompatible types, or mishandles NULLs (e.g. '= NULL' instead of 'IS NULL')."),
-    ("syntax_error", "Malformed SQL that would fail to parse or execute."),
-    ("inefficient_query", "Produces the correct result but is needlessly inefficient (e.g. a correlated subquery instead of a join, a missing sargable predicate causing a full scan, SELECT * bloat, redundant DISTINCT/GROUP BY)."),
+    ("missing_filters", "Omits a WHERE/HAVING condition (or LIMIT) the question implies, returning too many or the wrong rows."),
+    ("wrong_aggregation", "Uses the wrong aggregate function, groups by the wrong column, or aggregates over the wrong column entirely."),
+    ("unsafe_patterns", "Uses a risky/imprecise pattern like SELECT * or an unqualified cross join instead of the specific columns/join condition the question calls for."),
+    ("misjoined_tables", "Joins the wrong pair of tables, joins on the wrong column, or uses the wrong join type (e.g. INNER instead of LEFT), producing an incorrect result set."),
 ]
 REASON_NAMES = [name for name, _ in BAD_SQL_REASONS]
 
@@ -69,44 +73,29 @@ FEW_SHOT_EXAMPLES: list[dict[str, Any]] = [
         "response": {
             "sql_good": (
                 "SELECT category, SUM(price * units) AS revenue FROM sales "
-                "WHERE sale_date >= DATE_TRUNC('month', CURRENT_DATE - INTERVAL '1 month') "
-                "AND sale_date < DATE_TRUNC('month', CURRENT_DATE) GROUP BY category"
+                "WHERE sale_date >= '2024-01-01' AND sale_date < '2024-02-01' GROUP BY category"
             ),
+            "sql_context": [
+                "CREATE TABLE sales (id INTEGER PRIMARY KEY, category TEXT NOT NULL, price REAL NOT NULL, units INTEGER NOT NULL, sale_date TEXT NOT NULL)",
+                "INSERT INTO sales (category, price, units, sale_date) VALUES ('Electronics', 100.0, 3, '2024-01-05')",
+                "INSERT INTO sales (category, price, units, sale_date) VALUES ('Electronics', 50.0, 2, '2023-12-20')",
+                "INSERT INTO sales (category, price, units, sale_date) VALUES ('Books', 20.0, 5, '2024-01-15')",
+            ],
             "sql_bad": [
                 {
-                    "sql": "SELECT category, price * units FROM sales WHERE sale_date >= '2024-01-01' GROUP BY category",
-                    "reason": "wrong_join_or_aggregation",
-                },
-                {
-                    "sql": (
-                        "SELECT category, SUM(price * units) AS revenue FROM sales GROUP BY category"
-                    ),
-                    "reason": "wrong_filter_or_sort",
+                    "sql": "SELECT category, SUM(price * units) AS revenue FROM sales GROUP BY category",
+                    "reason": "missing_filters",
                 },
                 {
                     "sql": (
                         "SELECT category, SUM(price) AS revenue FROM sales "
-                        "WHERE sale_date >= DATE_TRUNC('month', CURRENT_DATE - INTERVAL '1 month') GROUP BY category"
+                        "WHERE sale_date >= '2024-01-01' AND sale_date < '2024-02-01' GROUP BY category"
                     ),
-                    "reason": "wrong_columns_or_tables",
+                    "reason": "wrong_aggregation",
                 },
                 {
-                    "sql": (
-                        "SELECT category SUM(price * units) AS revenue FROM sales "
-                        "WHERE sale_date >= DATE_TRUNC('month', CURRENT_DATE - INTERVAL '1 month') GROUP BY category"
-                    ),
-                    "reason": "syntax_error",
-                },
-                {
-                    "sql": (
-                        "SELECT DISTINCT category, (SELECT SUM(price * units) FROM sales s2 "
-                        "WHERE s2.category = s.category "
-                        "AND s2.sale_date >= DATE_TRUNC('month', CURRENT_DATE - INTERVAL '1 month') "
-                        "AND s2.sale_date < DATE_TRUNC('month', CURRENT_DATE)) AS revenue "
-                        "FROM sales s WHERE sale_date >= DATE_TRUNC('month', CURRENT_DATE - INTERVAL '1 month') "
-                        "AND sale_date < DATE_TRUNC('month', CURRENT_DATE)"
-                    ),
-                    "reason": "inefficient_query",
+                    "sql": "SELECT * FROM sales WHERE sale_date >= '2024-01-01' AND sale_date < '2024-02-01'",
+                    "reason": "unsafe_patterns",
                 },
             ],
         },
@@ -123,35 +112,36 @@ FEW_SHOT_EXAMPLES: list[dict[str, Any]] = [
                 "LEFT JOIN employee e ON e.department_id = d.id "
                 "GROUP BY d.name ORDER BY employee_count DESC"
             ),
+            "sql_context": [
+                "CREATE TABLE department (id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
+                "CREATE TABLE employee (id INTEGER PRIMARY KEY, name TEXT NOT NULL, department_id INTEGER)",
+                "INSERT INTO department (name) VALUES ('Engineering')",
+                "INSERT INTO department (name) VALUES ('Sales')",
+                "INSERT INTO department (name) VALUES ('Marketing')",
+                "INSERT INTO employee (name, department_id) VALUES ('Alice', 1)",
+                "INSERT INTO employee (name, department_id) VALUES ('Bob', 1)",
+                "INSERT INTO employee (name, department_id) VALUES ('Carol', 2)",
+            ],
             "sql_bad": [
                 {
                     "sql": (
                         "SELECT d.name, COUNT(e.id) AS employee_count FROM department d "
                         "JOIN employee e ON e.department_id = d.id GROUP BY d.name ORDER BY employee_count DESC"
                     ),
-                    "reason": "wrong_join_or_aggregation",
-                },
-                {
-                    "sql": (
-                        "SELECT d.name, COUNT(e.id) AS employee_count FROM department d "
-                        "LEFT JOIN employee e ON e.department_id = d.id GROUP BY d.name ORDER BY employee_count ASC"
-                    ),
-                    "reason": "wrong_filter_or_sort",
+                    "reason": "misjoined_tables",
                 },
                 {
                     "sql": (
                         "SELECT d.name, COUNT(id) AS employee_count FROM department d "
                         "LEFT JOIN employee e ON e.department_id = d.id GROUP BY d.name ORDER BY employee_count DESC"
                     ),
-                    "reason": "wrong_columns_or_tables",
+                    "reason": "wrong_aggregation",
                 },
                 {
                     "sql": (
-                        "SELECT d.name, COUNT(e.id) AS employee_count FROM department d "
-                        "LEFT JOIN employee e ON e.department_id = d.id WHERE e.department_id = d.id "
-                        "GROUP BY d.name ORDER BY employee_count DESC"
+                        "SELECT * FROM department d LEFT JOIN employee e ON e.department_id = d.id"
                     ),
-                    "reason": "type_or_null_handling",
+                    "reason": "unsafe_patterns",
                 },
             ],
         },
@@ -177,14 +167,20 @@ For each (question, sql_good) pair you are given:
 1. Check the candidate `sql_good` for correctness against the question. If it has a bug \
 (wrong result, wrong columns, wouldn't execute, etc.), rewrite it so it correctly and \
 idiomatically answers the question. If it is already correct, return it unchanged \
-(only cosmetic cleanup, e.g. consistent aliasing, is allowed).
-2. Produce between 3 and 5 "sql_bad" examples: plausible-looking SQL queries that a \
+(only cosmetic cleanup, e.g. consistent aliasing, is allowed). Target SQLite as the \
+dialect — these rows will be executed against an in-memory SQLite database.
+2. Produce `sql_context`: SQLite-compatible CREATE TABLE and INSERT INTO statements, in \
+execution order, defining a minimal schema and a small amount of sample data such that \
+`sql_good` can be run directly against them and returns a meaningful, non-trivial result \
+(at least one row, unless the question's own logic legitimately returns none). If \
+`sql_good` is itself a DDL statement (CREATE/ALTER/DROP TABLE) rather than a query over \
+existing data, return an empty `sql_context` array.
+3. Produce between 3 and 5 "sql_bad" examples: plausible-looking SQL queries that a \
 competent-but-imperfect model might write for the same question, each containing exactly \
-one meaningful problem — either an incorrectness issue, or (for the "inefficient_query" \
-category only) correct results reached in a needlessly costly way. Bad examples must be \
-diverse (no repeated mistake type within the same question) and must be *close misses* \
-that a careless reviewer could mistake for correct — not obviously broken SQL.
-3. Tag each sql_bad example with the single reason category from this list that best \
+one meaningful problem. Bad examples must be diverse (no repeated mistake type within the \
+same question) and must be *close misses* that a careless reviewer could mistake for \
+correct — not obviously broken SQL.
+4. Tag each sql_bad example with the single reason category from this list that best \
 explains its mistake:
 
 {_reasons_block()}
@@ -230,6 +226,15 @@ RESULT_SCHEMA = {
             "type": "string",
             "description": "Corrected SQL query that correctly answers the question.",
         },
+        "sql_context": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": (
+                "SQLite-compatible CREATE TABLE and INSERT INTO statements, in execution "
+                "order, defining a minimal schema and sample data sql_good can run "
+                "directly against. Empty if sql_good is itself a DDL statement."
+            ),
+        },
         "sql_bad": {
             "type": "array",
             "minItems": 3,
@@ -237,7 +242,7 @@ RESULT_SCHEMA = {
             "items": SQL_BAD_ITEM_SCHEMA,
         },
     },
-    "required": ["sql_good", "sql_bad"],
+    "required": ["sql_good", "sql_context", "sql_bad"],
     "additionalProperties": False,
 }
 
@@ -245,7 +250,7 @@ TOOL_NAME = "emit_sql_review"
 
 TOOL_SCHEMA = {
     "name": TOOL_NAME,
-    "description": "Return the corrected SQL and a set of labeled incorrect SQL variants for this question.",
+    "description": "Return the corrected SQL, its executable SQLite context, and a set of labeled incorrect SQL variants for this question.",
     "input_schema": RESULT_SCHEMA,
 }
 
@@ -308,7 +313,23 @@ def enhance_record(record: dict[str, Any], result: dict[str, Any]) -> dict[str, 
     merged = dict(record)
     merged["sql_good"] = result["sql_good"]
     merged["sql_bad"] = result["sql_bad"]
+    merged["sql_context"] = result["sql_context"]
+    # Local verification, no extra API call: does sql_good actually execute against the
+    # context the model just synthesized for it?
+    execution = run_sql(merged["sql_context"], merged["sql_good"])
+    merged["sql_context_valid"] = execution.success
     return merged
+
+
+def print_context_summary(records: list[dict[str, Any]]) -> None:
+    """Aggregate pass-rate signal, separate from the per-row sql_bad output: how many
+    sql_good rows actually executed against their generated sql_context, so a data-gen
+    run can be judged trustworthy (or not) before sinking a training run into it."""
+    total = len(records)
+    if not total:
+        return
+    valid = sum(1 for r in records if r.get("sql_context_valid"))
+    print(f"\nsql_good execution check: {valid}/{total} passed ({100 * valid / total:.1f}%)")
 
 
 # ---------------------------------------------------------------------------
@@ -337,6 +358,8 @@ def cmd_test(args: argparse.Namespace) -> None:
         merged = enhance_record(record, result)
         results.append(merged)
         print(json.dumps(merged, indent=2))
+
+    print_context_summary(results)
 
     if args.output:
         write_jsonl(results, args.output)
@@ -468,6 +491,7 @@ def cmd_collect(args: argparse.Namespace) -> None:
     write_jsonl(output_records, args.output)
     print(f"\nWrote {len(output_records)} enhanced examples to {args.output}")
     print(f"Counts: {counts}")
+    print_context_summary(output_records)
 
 
 # ---------------------------------------------------------------------------

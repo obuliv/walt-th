@@ -26,21 +26,42 @@ class Example:
     sql_good: str
     source: str
     sql_bad: tuple[SQLBadCandidate, ...] = ()
+    sql_context: tuple[str, ...] = ()
+    sql_context_valid: bool | None = None
+    split: str = "trainval"  # "trainval" | "val" — RM training/CV never sees "val" rows
 
     def __post_init__(self) -> None:
         if self.sql_good in {b.sql for b in self.sql_bad}:
             raise ValueError(f"sql_good duplicates a sql_bad entry for question: {self.question!r}")
 
     def to_dict(self) -> dict:
-        d = {"question": self.question, "sql_good": self.sql_good, "source": self.source}
+        d = {
+            "question": self.question,
+            "sql_good": self.sql_good,
+            "source": self.source,
+            "split": self.split,
+        }
         if self.sql_bad:
             d["sql_bad"] = [b.to_dict() for b in self.sql_bad]
+        if self.sql_context:
+            d["sql_context"] = list(self.sql_context)
+        if self.sql_context_valid is not None:
+            d["sql_context_valid"] = self.sql_context_valid
         return d
 
     @staticmethod
     def from_dict(d: dict) -> "Example":
         sql_bad = tuple(SQLBadCandidate.from_dict(b) for b in d.get("sql_bad", []))
-        return Example(question=d["question"], sql_good=d["sql_good"], source=d["source"], sql_bad=sql_bad)
+        sql_context = tuple(d.get("sql_context", []))
+        return Example(
+            question=d["question"],
+            sql_good=d["sql_good"],
+            source=d["source"],
+            sql_bad=sql_bad,
+            sql_context=sql_context,
+            sql_context_valid=d.get("sql_context_valid"),
+            split=d.get("split", "trainval"),
+        )
 
 
 class BaseAdapter(ABC):
