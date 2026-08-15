@@ -18,6 +18,6 @@ from walt.rm.model.sql_features import is_sql_valid
 
 
 class LRRewardModelV3(LRRewardModel):
-    def _phi(self, question: str, sql: str) -> np.ndarray:
-        base_phi = super()._phi(question, sql)
+    def _phi(self, question: str, sql: str, sql_context: tuple[str, ...] = ()) -> np.ndarray:
+        base_phi = super()._phi(question, sql, sql_context)
         return np.concatenate([base_phi, [1.0 if is_sql_valid(sql) else 0.0]])

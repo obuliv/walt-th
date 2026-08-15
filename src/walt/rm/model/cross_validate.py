@@ -21,9 +21,11 @@ from walt.rm.model.lr_model import SOLVER_BY_PENALTY, LRRewardModel
 from walt.rm.model.lr_model_v2 import LRRewardModelV2
 from walt.rm.model.lr_model_v3 import LRRewardModelV3
 from walt.rm.model.lr_model_v3_scaled import SCALING_CHOICES, LRRewardModelV3Scaled
+from walt.rm.model.lr_model_v4 import LRRewardModelV4
+from walt.rm.model.lr_model_v5 import LRRewardModelV5
 from walt.rm.model.tracking import log_run
 
-MODEL_CHOICES = ["lr_v1", "lr_v2", "lr_v3", "lr_v3_scaled", "gbm"]
+MODEL_CHOICES = ["lr_v1", "lr_v2", "lr_v3", "lr_v3_scaled", "lr_v4", "lr_v5", "gbm"]
 
 
 def main() -> None:
@@ -75,6 +77,10 @@ def main() -> None:
             )
         if args.model == "lr_v3":
             return LRRewardModelV3(embedding_provider=embedding_provider, seed=args.seed, C=args.C, penalty=args.penalty, l1_ratio=args.l1_ratio)
+        if args.model == "lr_v4":
+            return LRRewardModelV4(embedding_provider=embedding_provider, seed=args.seed, C=args.C, penalty=args.penalty, l1_ratio=args.l1_ratio)
+        if args.model == "lr_v5":
+            return LRRewardModelV5(embedding_provider=embedding_provider, seed=args.seed, C=args.C, penalty=args.penalty, l1_ratio=args.l1_ratio)
         if args.model == "lr_v3_scaled":
             return LRRewardModelV3Scaled(
                 embedding_provider=embedding_provider,

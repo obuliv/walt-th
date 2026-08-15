@@ -74,7 +74,10 @@ class LRRewardModel(BaseRewardModel):
         self._embed_unique(questions, self._question_cache)
         self._embed_unique(sqls, self._sql_cache)
 
-    def _phi(self, question: str, sql: str) -> np.ndarray:
+    def _phi(self, question: str, sql: str, sql_context: tuple[str, ...] = ()) -> np.ndarray:
+        # sql_context unused here — only context-aware subclasses (lr_model_context.py)
+        # read it; kept in the signature so fit()/score() can pass it uniformly to any
+        # subclass's _phi without knowing whether that subclass cares.
         q_vec = self._question_cache[question]
         sql_vec = self._sql_cache[sql]
         cos_sim = float(np.dot(q_vec, sql_vec))
@@ -93,8 +96,8 @@ class LRRewardModel(BaseRewardModel):
                     a_sql, b_sql, label = ex.sql_good, bad.sql, 1
                 else:
                     a_sql, b_sql, label = bad.sql, ex.sql_good, 0
-                phi_a = self._phi(ex.question, a_sql)
-                phi_b = self._phi(ex.question, b_sql)
+                phi_a = self._phi(ex.question, a_sql, ex.sql_context)
+                phi_b = self._phi(ex.question, b_sql, ex.sql_context)
                 X_rows.append(phi_a - phi_b)
                 y_rows.append(label)
 
@@ -137,12 +140,12 @@ class LRRewardModel(BaseRewardModel):
             "fit_seconds": round(fit_seconds, 3),
         }
 
-    def score(self, question: str, sql: str) -> float:
+    def score(self, question: str, sql: str, sql_context: tuple[str, ...] = ()) -> float:
         if self.coef_ is None:
             raise RuntimeError("LRRewardModel.score() called before fit()/load()")
         self._embed_unique([question], self._question_cache)
         self._embed_unique([sql], self._sql_cache)
-        phi = self._phi(question, sql)
+        phi = self._phi(question, sql, sql_context)
         return float(np.dot(self.coef_, phi))
 
     def save(self, path: str | Path) -> None:

@@ -22,9 +22,11 @@ from walt.rm.model.gbm_model import GBMRewardModel
 from walt.rm.model.lr_model import LRRewardModel
 from walt.rm.model.lr_model_v2 import LRRewardModelV2
 from walt.rm.model.lr_model_v3 import LRRewardModelV3
+from walt.rm.model.lr_model_v4 import LRRewardModelV4
+from walt.rm.model.lr_model_v5 import LRRewardModelV5
 from walt.rm.model.tracking import log_run
 
-MODEL_CHOICES = ["lr_v1", "lr_v2", "lr_v3", "gbm"]
+MODEL_CHOICES = ["lr_v1", "lr_v2", "lr_v3", "lr_v4", "lr_v5", "gbm"]
 
 
 def main() -> None:
@@ -74,6 +76,10 @@ def main() -> None:
         )
     elif args.model == "lr_v3":
         model = LRRewardModelV3(embedding_provider=embedding_provider, seed=args.seed, C=args.C)
+    elif args.model == "lr_v4":
+        model = LRRewardModelV4(embedding_provider=embedding_provider, seed=args.seed, C=args.C)
+    elif args.model == "lr_v5":
+        model = LRRewardModelV5(embedding_provider=embedding_provider, seed=args.seed, C=args.C)
     else:
         model = GBMRewardModel(
             embedding_provider=embedding_provider,
@@ -125,7 +131,7 @@ def main() -> None:
                 "n_train": len(train_examples),
                 "n_test": len(test_examples),
                 **load_stats,  # n_rows_total, n_rows_skipped
-                **({"C": args.C} if args.model in ("lr_v1", "lr_v2", "lr_v3") else {}),
+                **({"C": args.C} if args.model in ("lr_v1", "lr_v2", "lr_v3", "lr_v4", "lr_v5") else {}),
                 **(
                     {
                         "v2_cosine_sim": args.v2_cosine_sim,

@@ -20,6 +20,7 @@ TABLE_KEYS = [
     "sql_pass_rate_without_rm",
     "qa_accuracy_with_rm",
     "qa_accuracy_without_rm",
+    "oracle_ceiling",
 ]
 
 # Two series *groups* (sql_pass_rate, qa_accuracy), each split with_rm/without_rm — drawn
@@ -28,6 +29,11 @@ TABLE_KEYS = [
 # CVD separation (see rm/model/visualize.py's SERIES_COLORS comment).
 GROUP_COLORS = {"sql_pass_rate": "#2a78d6", "qa_accuracy": "#eb6834"}
 LINESTYLES = {"with_rm": "-", "without_rm": "--"}
+# oracle_ceiling has no with/without split (it's a property of the LLM's candidates, not
+# the reranker) — drawn as its own solid line in a third, distinct color rather than
+# forced into the group/linestyle pairing above; it's the headroom qa_accuracy_with_rm
+# is bounded by, so seeing both trend together over runs is the point.
+CEILING_COLOR = "#3fa34d"
 SURFACE = "#fcfcfb"
 INK_PRIMARY = "#0b0b0b"
 INK_SECONDARY = "#52514e"
@@ -100,6 +106,30 @@ def plot_comparison(runs: list[dict], output_path: Path) -> None:
                     color=color,
                     fontsize=9,
                 )
+
+    ceiling_y = [run["metrics"].get("oracle_ceiling") for run in runs]
+    if any(v is not None for v in ceiling_y):
+        ax.plot(
+            x,
+            ceiling_y,
+            label="oracle_ceiling",
+            color=CEILING_COLOR,
+            linestyle=":",
+            linewidth=2,
+            marker="o",
+            markersize=6,
+            markeredgewidth=0,
+        )
+        if ceiling_y[-1] is not None:
+            ax.annotate(
+                f"{ceiling_y[-1]:.3f}",
+                xy=(x[-1], ceiling_y[-1]),
+                xytext=(6, 0),
+                textcoords="offset points",
+                va="center",
+                color=CEILING_COLOR,
+                fontsize=9,
+            )
 
     ax.set_ylim(0, 1)
     ax.set_xlim(-0.3, len(x) - 1 + 0.6)  # headroom on the right for endpoint value labels

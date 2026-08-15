@@ -1,13 +1,21 @@
 """Agent-level evaluation on the held-out val split (rows with split="val", produced by
 pre_process.py and never seen by RM training/CV — see rm/data/pre_process.py).
 
-Reports three things:
+Reports four things:
   1. RM accuracy selecting correct SQL among sql_good vs sql_bad (BaseRewardModel.evaluate()).
   2. SQL execution pass/fail and 3. end-to-end QA accuracy, each reported *with* RM
      reranking (the agent's actual top-ranked pick) and *without* it (the first LLM
      candidate, i.e. what a single-shot call with no RM would have produced) — using the
      same generated candidates for both, so this isolates the RM's contribution without
      doubling the (expensive) LLM calls.
+  4. Oracle ceiling: of the n candidates the LLM generated for each question (before any
+     reranking), how many are actually correct? Bucketed into all_correct (any pick
+     wins), zero_correct (unreachable by any reranker — an LLM generation-quality
+     ceiling, not an RM problem), and mixed (selection actually matters) — with the
+     mixed bucket's with-RM/without-RM achieved rates compared against the random-chance
+     expectation, so a low "achieved" number can be told apart from "there was nothing
+     to achieve." Answers "how much room does reranking have to grow" independent of
+     whether the RM specifically is any good.
 
 Usage:
     python -m walt.eval.evaluate --input data/output/rm_enhanced.jsonl
@@ -45,6 +53,18 @@ def evaluate_agent(val_examples: list[Example], agent: SqlAgent) -> dict[str, An
     rm_pass = base_pass = 0
     rm_qa = base_qa = 0
 
+    # Oracle ceiling: of the n candidates the LLM generated (before any reranking), how
+    # many are actually correct? This bounds how much reranking — RM or otherwise —
+    # could ever achieve. Bucketed per row: all_correct (any pick wins, nothing to
+    # rerank), zero_correct (unreachable — a pure LLM generation-quality ceiling, not an
+    # RM problem), mixed (0 < n_correct < n — the only bucket where selection quality
+    # actually matters). Within the mixed bucket, "achieved" (with/without RM) is
+    # compared against the random-chance expectation (weighted by n_correct/n per row)
+    # to tell whether reranking is doing better than a coin flip.
+    n_all_correct = n_zero_correct = n_mixed = 0
+    mixed_rm_correct = mixed_base_correct = 0
+    mixed_expected_random = 0.0
+
     print(f"Running agent over {len(executable)} executable val rows...")
     for i, ex in enumerate(executable, 1):
         try:
@@ -72,8 +92,29 @@ def evaluate_agent(val_examples: list[Example], agent: SqlAgent) -> dict[str, An
 
         if ex.sql_context_valid:
             reference = run_sql(ex.sql_context, ex.sql_good)
-            rm_qa += int(_rows_match(rm_execution, reference))
-            base_qa += int(_rows_match(base_execution, reference))
+            rm_correct = _rows_match(rm_execution, reference)
+            base_correct = _rows_match(base_execution, reference)
+            rm_qa += int(rm_correct)
+            base_qa += int(base_correct)
+
+            # Reuse the two executions already computed above instead of re-running
+            # identical SQL — result.best_sql/baseline_sql are always among raw_candidates.
+            executions_by_sql = {result.best_sql: rm_execution, baseline_sql: base_execution}
+            n_correct = 0
+            for sql in result.raw_candidates:
+                execution = executions_by_sql.setdefault(sql, run_sql(ex.sql_context, sql))
+                n_correct += int(_rows_match(execution, reference))
+
+            n_candidates = len(result.raw_candidates)
+            if n_correct == n_candidates:
+                n_all_correct += 1
+            elif n_correct == 0:
+                n_zero_correct += 1
+            else:
+                n_mixed += 1
+                mixed_rm_correct += int(rm_correct)
+                mixed_base_correct += int(base_correct)
+                mixed_expected_random += n_correct / n_candidates
 
         if i % 10 == 0 or i == len(executable):
             print(
@@ -90,6 +131,21 @@ def evaluate_agent(val_examples: list[Example], agent: SqlAgent) -> dict[str, An
         "qa_accuracy": {
             "with_rm": _rate(rm_qa, len(qa_examples)),
             "without_rm": _rate(base_qa, len(qa_examples)),
+        },
+        "oracle": {
+            # "ceiling" = fraction of rows where at least one candidate is correct —
+            # the best any reranker (RM or otherwise) could ever achieve on this data.
+            "ceiling": _rate(n_all_correct + n_mixed, len(qa_examples)),
+            "all_candidates_correct": _rate(n_all_correct, len(qa_examples)),
+            "zero_candidates_correct": _rate(n_zero_correct, len(qa_examples)),
+            "mixed": _rate(n_mixed, len(qa_examples)),
+            "mixed_achieved_with_rm": _rate(mixed_rm_correct, n_mixed),
+            "mixed_achieved_without_rm": _rate(mixed_base_correct, n_mixed),
+            "mixed_expected_random": {
+                "expected_correct": round(mixed_expected_random, 2),
+                "total": n_mixed,
+                "rate": mixed_expected_random / n_mixed if n_mixed else None,
+            },
         },
     }
 
@@ -142,6 +198,20 @@ def main() -> None:
     _print_line("with RM   ", qa["with_rm"])
     _print_line("without RM", qa["without_rm"])
 
+    oracle = agent_metrics["oracle"]
+    print("\n4. Oracle ceiling (how many of the n generated candidates are even correct — how much room reranking has to grow):")
+    _print_line("any candidate correct (ceiling)", oracle["ceiling"])
+    _print_line("all candidates correct         ", oracle["all_candidates_correct"])
+    _print_line("zero candidates correct        ", oracle["zero_candidates_correct"])
+    _print_line("mixed (selection matters)      ", oracle["mixed"])
+    if oracle["mixed"]["count"]:
+        exp = oracle["mixed_expected_random"]
+        print("  within the mixed bucket:")
+        _print_line("    achieved with RM   ", oracle["mixed_achieved_with_rm"])
+        _print_line("    achieved without RM", oracle["mixed_achieved_without_rm"])
+        rate = f" ({exp['rate']:.1%})" if exp["rate"] is not None else ""
+        print(f"    expected by random pick: {exp['expected_correct']:.1f}/{exp['total']}{rate}")
+
     summary = {"rm_metrics": rm_metrics, **agent_metrics}
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -171,12 +241,20 @@ def main() -> None:
                 "sql_pass_rate_without_rm": sp["without_rm"]["rate"],
                 "qa_accuracy_with_rm": qa["with_rm"]["rate"],
                 "qa_accuracy_without_rm": qa["without_rm"]["rate"],
+                "oracle_ceiling": oracle["ceiling"]["rate"],
+                "oracle_all_correct_rate": oracle["all_candidates_correct"]["rate"],
+                "oracle_zero_correct_rate": oracle["zero_candidates_correct"]["rate"],
+                "oracle_mixed_rate": oracle["mixed"]["rate"],
+                "oracle_mixed_achieved_with_rm": oracle["mixed_achieved_with_rm"]["rate"],
+                "oracle_mixed_achieved_without_rm": oracle["mixed_achieved_without_rm"]["rate"],
+                "oracle_mixed_expected_random_rate": oracle["mixed_expected_random"]["rate"],
             },
             training={
                 "n_executable": sp["with_rm"]["total"],
                 "n_qa_examples": qa["with_rm"]["total"],
                 "sql_pass_rate": agent_metrics["sql_pass_rate"],
                 "qa_accuracy": agent_metrics["qa_accuracy"],
+                "oracle": oracle,
             },
         )
         print(f"Logged run to {run_path}")

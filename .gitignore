@@ -230,6 +230,10 @@ Thumbs.db
 # Anthropic batch job state (custom_id -> record mappings, in-flight batch ids)
 .batch_state/
 
+# Raw gretelai/synthetic_text_to_sql parquet cache (downloaded by build_gretel_dataset.py;
+# too large to track, and trivially re-downloadable) — the sampled JSONL output is committed.
+data/gretel/
+
 # Secrets / credentials
 *.pem
 *.key

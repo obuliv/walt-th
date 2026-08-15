@@ -75,7 +75,7 @@ class LRRewardModelV2(LRRewardModel):
     def _raw_dot(self, question: str, sql: str) -> float:
         return float(np.dot(self._question_cache[question], self._sql_cache[sql]))
 
-    def _phi(self, question: str, sql: str) -> np.ndarray:
+    def _phi(self, question: str, sql: str, sql_context: tuple[str, ...] = ()) -> np.ndarray:
         q_raw = self._question_cache[question]
         sql_raw = self._sql_cache[sql]
         sql_norm = sql_raw / np.linalg.norm(sql_raw)

@@ -77,7 +77,7 @@ class SqlAgent:
         )
         if not candidates:
             raise RuntimeError(f"LLM produced no candidate SQL for question: {question!r}")
-        scored = self.rm.rank(question, candidates)
+        scored = self.rm.rank(question, candidates, sql_context=tuple(schema_context))
         best = scored[0]
         execution = run_sql(schema_context, best.sql)
         return AgentResult(

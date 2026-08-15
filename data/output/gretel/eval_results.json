@@ -1,0 +1,82 @@
+{
+  "rm_metrics": {
+    "n_examples": 147,
+    "n_pairs": 631,
+    "top1_accuracy": 0.54421768707483,
+    "pairwise_accuracy": 0.8684627575277337,
+    "mrr": 0.7553287981859408,
+    "pairwise_accuracy_by_reason": {
+      "misjoined_tables": 0.8163265306122449,
+      "missing_filters": 0.8481012658227848,
+      "unsafe_patterns": 0.9440559440559441,
+      "wrong_aggregation": 0.8514851485148515
+    },
+    "n_pairs_by_reason": {
+      "misjoined_tables": 49,
+      "missing_filters": 237,
+      "unsafe_patterns": 143,
+      "wrong_aggregation": 202
+    }
+  },
+  "sql_pass_rate": {
+    "with_rm": {
+      "count": 131,
+      "total": 147,
+      "rate": 0.891156462585034
+    },
+    "without_rm": {
+      "count": 135,
+      "total": 147,
+      "rate": 0.9183673469387755
+    }
+  },
+  "qa_accuracy": {
+    "with_rm": {
+      "count": 55,
+      "total": 147,
+      "rate": 0.3741496598639456
+    },
+    "without_rm": {
+      "count": 59,
+      "total": 147,
+      "rate": 0.4013605442176871
+    }
+  },
+  "oracle": {
+    "ceiling": {
+      "count": 75,
+      "total": 147,
+      "rate": 0.5102040816326531
+    },
+    "all_candidates_correct": {
+      "count": 36,
+      "total": 147,
+      "rate": 0.24489795918367346
+    },
+    "zero_candidates_correct": {
+      "count": 72,
+      "total": 147,
+      "rate": 0.4897959183673469
+    },
+    "mixed": {
+      "count": 39,
+      "total": 147,
+      "rate": 0.2653061224489796
+    },
+    "mixed_achieved_with_rm": {
+      "count": 19,
+      "total": 39,
+      "rate": 0.48717948717948717
+    },
+    "mixed_achieved_without_rm": {
+      "count": 23,
+      "total": 39,
+      "rate": 0.5897435897435898
+    },
+    "mixed_expected_random": {
+      "expected_correct": 17.8,
+      "total": 39,
+      "rate": 0.45641025641025634
+    }
+  }
+}

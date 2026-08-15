@@ -45,10 +45,19 @@ for agent-level evaluation and never seen by RM training/CV (see Architecture):
 uv run python -m walt.rm.data.pre_process --target-count 5000 --val-fraction 0.15 --output data/output/rm_data.jsonl
 ```
 
+Alternatively, build the gretel-only dataset (own pipeline, own output location — see
+Architecture) by sampling directly from gretel's own train/test splits:
+```bash
+uv run python -m walt.rm.data.build_gretel_dataset --train-count 2000 --test-count 200
+```
+
 Generate `sql_bad` negatives, correct `sql_good`, and synthesize an executable SQLite
 `sql_context` via Claude (three modes) — both `test` and `collect` print an aggregate
 `sql_good execution check: N/M passed (...%)` summary so data quality can be judged
-before training on it:
+before training on it. Rows that already carry a verified `sql_context` (e.g. from
+`build_gretel_dataset.py`) automatically skip `sql_good`/`sql_context` generation and
+only get `sql_bad` (see Architecture); rows with a `sql_context` already known invalid
+are skipped entirely, printed as `Skipping N row(s) with a known-invalid sql_context`:
 ```bash
 # iterate on the prompt cheaply, synchronous calls on a few rows
 uv run python -m walt.rm.data.gen_training_data test --input data/output/rm_data.jsonl --limit 3
@@ -62,7 +71,8 @@ uv run python -m walt.rm.data.gen_training_data collect --batch-id msgbatch_xxx 
 
 Train a pairwise-ranking reward model on `rm_enhanced.jsonl`, evaluate on a held-out
 split, and check the train/test gap for overfitting (`--model` selects `lr_v1`/`lr_v2`/
-`lr_v3`/`gbm`, default `lr_v3` with `--C 30`; see Architecture below for why):
+`lr_v3`/`lr_v4`/`lr_v5`/`gbm` — v4/v5 also consume `sql_context`, see Architecture below
+for why neither beats v3 — default `lr_v3` with `--C 30`; see Architecture below for why):
 ```bash
 uv run python -m walt.rm.model.train \
   --input data/output/rm_enhanced.jsonl \
@@ -155,6 +165,31 @@ Output convention: JSONL files under `data/output/`, one JSON object per
 line (`rm_data.jsonl` = stage 2 output, `rm_enhanced.jsonl` = stage 3
 output).
 
+**gretel (`gretel.py`/`build_gretel_dataset.py`, 2026-08-15)** is a second, parallel
+pipeline outside the `pre_process.py`/`SOURCES` flow above, for
+`gretelai/synthetic_text_to_sql` — added because that dataset already ships its own
+`sql_context` per row (no LLM synthesis needed) and its own train/test split (no
+re-splitting needed). `GretelAdapter` downloads the HF-hosted parquet directly
+(`pyarrow`, no `datasets` dependency needed), splits the dataset's single
+semicolon-joined `sql_context` string into individual statements via `sqlglot` (falls
+back to a naive `;`-split on a sqlglot parse error — a handful of rows use
+non-SQLite-dialect syntax sqlglot's sqlite mode rejects), and verifies each locally via
+`run_sql()` at extraction time rather than deferring to `gen_training_data.py`.
+`build_gretel_dataset.py` samples exactly `--train-count`/`--test-count` rows from
+gretel's own `train`/`test` splits (mapped to our `split="trainval"`/`"val"` — never
+re-splitting their train data ourselves) and writes to the separate
+`data/output/gretel/gretel_data.jsonl` (not merged into `rm_data.jsonl`). Raw parquet is
+cached (gitignored, ~32MB) under `data/gretel/`.
+
+`gen_training_data.py` now branches per-row on whether `sql_context` is already
+populated: rows without one go through the original full flow (`emit_sql_review`) as
+described above; rows that already have one (gretel) go through a second
+`emit_sql_bad`-only tool call, told not to touch `sql_good`/`sql_context` and just
+generate `sql_bad` against them (`has_context()`/`BAD_ONLY_*` in the module).
+`is_llm_ready()` additionally skips, before either `test` or `submit` spends a call,
+rows whose `sql_context_valid` was already computed `False` at extraction time — bad-only
+mode can't fix those (~532/2200 for gretel, mostly non-SQLite-dialect source schemas).
+
 **Reward model (`src/walt/rm/model/`)** scores/ranks SQL candidates for a question.
 `BaseRewardModel` (`base.py`) is algorithm-agnostic: question-level train/test split
 (`group_split` — splits by `Example`, never by pair, to avoid leaking a question's
@@ -245,15 +280,70 @@ prompt-robustness gap, ~2% of rows). Of the 980: 836 `trainval` / 144 `val`, and
 `sql_context_valid` passed for 899/980 (91.7%) — the 4 reason categories are reasonably
 balanced (830-1078 `sql_bad` instances each).
 
-**Current best baseline: `lr_v3` with `C=30`, retrained on the regenerated data above**
-— `top1_accuracy` 0.6587, `pairwise_accuracy` 0.8982, `mrr` 0.8179 on the standard 80/20
-`trainval` split (5-fold CV: 0.6448 ± 0.0303 / 0.8955 ± 0.0097 / 0.8117 ± 0.0165), with a
-moderate overfitting gap (+0.078/+0.028/+0.045 — wider than the ~+0.02-0.03 seen
-pre-regeneration, plausibly just a smaller effective `trainval` pool: 836 rows vs the
-old 978). Not directly comparable to the pre-regeneration numbers (`top1_accuracy`
-0.546, `pairwise_accuracy` 0.864, `mrr` 0.738, vs the original untuned `lr_v1`
-baseline's 0.424/0.811/0.658) — both the `sql_bad` taxonomy and the row set changed,
-not just `C`.
+**Superseded baseline (spider/dbasql only): `lr_v3` with `C=30`, retrained on the
+regenerated data above** — `top1_accuracy` 0.6587, `pairwise_accuracy` 0.8982, `mrr`
+0.8179 on the standard 80/20 `trainval` split (5-fold CV: 0.6448 ± 0.0303 / 0.8955 ±
+0.0097 / 0.8117 ± 0.0165), with a moderate overfitting gap (+0.078/+0.028/+0.045 — wider
+than the ~+0.02-0.03 seen pre-regeneration, plausibly just a smaller effective
+`trainval` pool: 836 rows vs the old 978). Not directly comparable to the
+pre-regeneration numbers (`top1_accuracy` 0.546, `pairwise_accuracy` 0.864, `mrr` 0.738,
+vs the original untuned `lr_v1` baseline's 0.424/0.811/0.658) — both the `sql_bad`
+taxonomy and the row set changed, not just `C`. See below for the current baseline —
+kept here only as a before/after reference point.
+
+**Current best baseline: `lr_v3` with `C=1000`, spider/dbasql + gretel combined
+(2026-08-15).** `data/output/rm_enhanced_with_gretel.jsonl` = the 980-row
+`rm_enhanced.jsonl` above plus the 1666-row `gretel_enhanced.jsonl` (gretel data run
+through `gen_training_data.py`'s bad-only mode — see gretel pipeline above), 2646 rows
+total / 2642 usable (4 more hit the same `sql_good`-duplicates-`sql_bad` skip as
+before) — 2355 `trainval` / 291 `val`. On this combined set, `C=30` (tuned on the old,
+smaller `trainval` pool) noticeably *underperforms*: CV-sweeping `C` from 3 to 3000
+(`cross_validate.py --model lr_v3 --C ...`) showed top1_accuracy still climbing well
+past the old sweet spot — 0.542 (`C=3`) → 0.580 (`C=30`) → 0.602 (`C=300`) — before
+plateauing at ~0.60 through `C=3000`, with `C=1000` landing on that plateau at the
+tightest variance by far (top1 0.6006 ± 0.0056, vs ±0.015-0.024 for every other `C`
+tried) — more data supporting much less regularization, as expected. Standard 80/20
+split at `C=1000`: `top1_accuracy` 0.6128, `pairwise_accuracy` 0.8794, `mrr` 0.7877,
+overfitting gap +0.016/+0.013/+0.014 (tighter than the superseded baseline's, despite
+~3x the `trainval` rows — plausibly gretel's added diversity, not just row count).
+**These numbers are lower than the superseded spider/dbasql-only baseline above**
+(0.6587/0.8982/0.8179) despite the re-tuned `C` — confirmed by both CV and the single
+split, so it isn't split noise. Likely cause: gretel spans far more diverse
+domains/schemas per question than spider/dbasql, so `phi`'s embedding-similarity signal
+has more surface area to get confused by; per-category breakdown on the combined set is
+`unsafe_patterns` 0.95, `wrong_aggregation` 0.87, `missing_filters` 0.85,
+`misjoined_tables` 0.84 (weakest, consistent with the superseded baseline). Read this as
+a harder, more realistic baseline rather than a regression to fix — the smaller,
+narrower old dataset was measuring an easier task.
+
+**Making the RM consume `sql_context` (the schema `sql` executes against) — two things
+tried, neither beats plain `lr_v3` (2026-08-15).** `BaseRewardModel.score()`/`rank()`
+and `LRRewardModel._phi()`/`fit()` now thread an optional `sql_context: tuple[str, ...]`
+through end to end (`evaluate()` passes `ex.sql_context`; `sql_agent.py` passes
+`schema_context`) — plumbing any future context-aware variant needs, kept even though
+neither variant below won:
+- **`LRRewardModelV4`** (`lr_model_v4.py`): appends one scalar,
+  `cosine_sim(embed(sql_context), embed(sql))`, to V3's phi (context embedded once per
+  example, keyed by the joined statement text — see `lr_model_context.py`'s
+  `ContextAwareLRRewardModel`, shared by V4/V5). The feature is real — a fitted
+  coefficient of 1.15 at `C=1000`, not zeroed out — but CV-tied with plain `lr_v3` at
+  every `C` tried (300/1000/3000; e.g. `C=1000` top1 0.5993 ± 0.0196 vs V3's
+  0.6006 ± 0.0056), with consistently *higher* variance than V3 alone. No measurable
+  benefit.
+- **`LRRewardModelV5`** (`lr_model_v5.py`): concatenates the full `embed(sql_context)`
+  vector (not just a scalar) alongside `embed(sql)`. This one isn't a "no signal"
+  result — it's structurally inert. `LRRewardModel.fit()` trains on the *pairwise
+  difference* `phi(q, sql_good) - phi(q, sql_bad)`; `sql_context` is identical across
+  every candidate for a given question, so `embed(sql_context)` cancels to *exactly*
+  zero in every training row regardless of what it encodes. Confirmed directly: the
+  fitted coefficient block for those 768 dims is `0.0` to the last bit, and V5's
+  predictions are byte-identical to V3's on the standard 80/20 split. Concatenating a
+  per-question-constant feature can never contribute a gradient under this
+  pairwise-difference objective — fixing it for real would need either a per-candidate
+  interaction (e.g. `embed(sql_context) * embed(sql)` elementwise, generalizing V4's
+  scalar to a full vector instead of a raw concat) or switching to pointwise training
+  like `GBMRewardModel` (which already underperformed pairwise `lr_v1` here — see
+  below). Left undone; this is documented as a dead end, not attempted further.
 
 **Embedding model choice matters more than any single feature/hyperparameter change
 tried so far.** CV-swept `lr_v3`/`C=30` against two general-purpose alternatives —
@@ -339,20 +429,34 @@ LLM calls. Enabled by default on both `sql_agent.py`'s CLI and `evaluate.py`
 
 **Agent-level evaluation (`src/walt/eval/evaluate.py`)** runs the agent over the
 held-out `split == "val"` rows (never seen by RM training/CV — see above) and reports
-three things: (1) RM accuracy discriminating `sql_good` vs `sql_bad`, via the existing
+four things: (1) RM accuracy discriminating `sql_good` vs `sql_bad`, via the existing
 `BaseRewardModel.evaluate()` — no new logic; (2) SQL execution pass/fail, and (3)
 end-to-end QA accuracy (row-set match between the agent's executed result and
 `run_sql(sql_context, sql_good)`'s reference result) — both (2) and (3) reported *with*
 RM reranking (the agent's actual top pick) *and* without it (the first generated
 candidate, i.e. what a single-shot call with no RM would produce), reusing the same
-generated candidates for both so the comparison costs no extra LLM calls. Each run logs
-a record to `data/output/eval_runs/` via `rm/model/tracking.py`'s `log_run`/`load_runs`
-(reused as-is — already algorithm-agnostic, not tied to RM training) with a flat
-`metrics` dict (`rm_top1_accuracy`, `sql_pass_rate_with_rm`/`_without_rm`,
-`qa_accuracy_with_rm`/`_without_rm`) so `eval/visualize.py` — the same table+chart
-pattern as `rm/model/visualize.py`, one color per metric group and solid/dashed
-linestyle for with/without RM rather than a 4th color — can track the RM-vs-no-RM gap
-across runs over time.
+generated candidates for both so the comparison costs no extra LLM calls; and (4) an
+**oracle ceiling** (added 2026-08-15, previously a one-off ad hoc analysis — now a
+standard part of every run): of the `n_candidates` the LLM generated per question, how
+many actually execute to the correct answer, bucketed per row into `all_correct` (any
+pick wins — nothing to rerank), `zero_correct` (unreachable by *any* reranker — an LLM
+generation-quality ceiling, not an RM problem), and `mixed` (0 < n_correct < n —
+the only bucket where selection quality actually matters). `ceiling` =
+`(all_correct + mixed) / n_qa_examples` is the best any reranker could ever score; within
+`mixed`, the with-RM/without-RM achieved rates are compared against the random-chance
+expectation (`Σ n_correct/n_candidates` over that bucket) so a low achieved number can
+be told apart from "there was nothing to achieve." Reuses `rm_execution`/`base_execution`
+already computed for (2)/(3) instead of re-running identical SQL, so this costs no extra
+LLM calls and only a handful of extra local `run_sql()` calls (up to `n_candidates - 2`
+per row). Each run logs a record to `data/output/eval_runs/` via `rm/model/tracking.py`'s
+`log_run`/`load_runs` (reused as-is — already algorithm-agnostic, not tied to RM
+training) with a flat `metrics` dict (`rm_top1_accuracy`, `sql_pass_rate_with_rm`/
+`_without_rm`, `qa_accuracy_with_rm`/`_without_rm`, `oracle_ceiling` and friends) so
+`eval/visualize.py` — the same table+chart pattern as `rm/model/visualize.py`, one color
+per metric group and solid/dashed linestyle for with/without RM, plus a third dotted
+line for `oracle_ceiling` (no with/without split — it's a property of the LLM's
+candidates, not the reranker) — can track the RM-vs-no-RM gap *and* the ceiling it's
+bounded by across runs over time.
 
 **Finding: the RM does not transfer to `llama3.2`'s candidate distribution
 (2026-08-15).** On the 144-row val set (123 executable rows, `n_candidates=5`),
@@ -379,4 +483,32 @@ bucket where selection quality actually matters. In that bucket, current achieve
 (29/54) is barely above the ~26.8/54 a purely random pick would be expected to get by
 chance (weighted by how many of the 5 are correct per row) — confirming the RM has
 ~no discriminative signal on `llama3.2`'s candidates specifically, consistent with the
-disagreement finding above.
+disagreement finding above. Originally a one-off ad hoc analysis; re-run against the
+now-integrated `evaluate.py` oracle-ceiling logic (see above) and reproduced exactly
+(77.2%/41/28/54/29/54), confirming the two methodologies agree.
+
+**Agent baseline on gretel's val split (2026-08-15): the transfer gap is worse here, not
+just present.** Same setup (`n_candidates=5`, `llama3.2`), run against
+`data/output/gretel/gretel_enhanced.jsonl`'s 147 executable val rows with the current
+best RM (`lr_v3`/`C=1000` on the combined dataset — see baseline above). RM accuracy
+(`sql_good` vs `sql_bad`) on this split: top1 0.544 — noticeably below the 0.613 the
+same RM gets on the combined 80/20 split, consistent with gretel being the harder
+subset throughout this file. At the agent level, RM reranking doesn't just fail to
+help as on spider/dbasql (tied) — it actively *hurts* both metrics: SQL execution pass
+131/147 (89.1%) with RM vs 135/147 (91.8%) without, QA accuracy 55/147 (37.4%) with RM
+vs 59/147 (40.1%) without (a ~2.7pp regression each, not noise-sized given the n=147
+sample). Separately, raw QA accuracy here (37-40%) is far below spider/dbasql's ~57%
+regardless of reranking — `llama3.2` itself generates correct SQL far less often for
+gretel's more domain-diverse questions, so this isn't purely an RM transfer problem;
+generation quality is also lower on this harder distribution. Logged to
+`data/output/eval_runs/20260815T235055Z_lr_v3_C1000_with_gretel_on_gretel_val.json`.
+
+Oracle ceiling on this split confirms it's a generation-quality problem more than a
+reranking problem: **51.0% (75/147)**, vs spider/dbasql's 77.2% — a much lower ceiling.
+`zero_correct` is 49.0% (72/147, more than double spider/dbasql's 22.8%) — nearly half
+the val set is unreachable by *any* reranker, `all_correct` is 24.5% (36/147), leaving
+`mixed` at 26.5% (39/147). Within that mixed bucket the pattern from spider/dbasql
+repeats and sharpens: achieved-without-RM (59.0%, 23/39) clearly beats both
+achieved-with-RM (48.7%, 19/39) *and* the random-chance expectation (45.6%, 17.8/39) —
+RM reranking is worse than doing nothing, and only barely better than chance, on
+gretel's candidates specifically.
