@@ -66,15 +66,24 @@ def _format_answer(execution: ExecutionResult) -> str | None:
 
 
 class SqlAgent:
-    def __init__(self, llm: BaseLLM, rm: BaseRewardModel, n_candidates: int = 5):
+    def __init__(
+        self,
+        llm: BaseLLM,
+        rm: BaseRewardModel,
+        n_candidates: int = 5,
+        strip_llm_context: bool = False,
+    ):
         self.llm = llm
         self.rm = rm
         self.n_candidates = n_candidates
+        # When True, the LLM generates blind (no schema) while execution/scoring still
+        # use the real schema_context — isolates the effect of schema-grounded generation
+        # from everything else in the pipeline (RM scoring, SQL execution).
+        self.strip_llm_context = strip_llm_context
 
     def run(self, question: str, schema_context: list[str]) -> AgentResult:
-        candidates = self.llm.generate_candidates(
-            question, "\n".join(schema_context), self.n_candidates
-        )
+        llm_context = "" if self.strip_llm_context else "\n".join(schema_context)
+        candidates = self.llm.generate_candidates(question, llm_context, self.n_candidates)
         if not candidates:
             raise RuntimeError(f"LLM produced no candidate SQL for question: {question!r}")
         scored = self.rm.rank(question, candidates, sql_context=tuple(schema_context))
@@ -106,11 +115,12 @@ def run_agent(
     ollama_model: str = "llama3.2",
     n_candidates: int = 5,
     llm_cache_path: str | Path | None = "data/output/llm_cache.json",
+    strip_llm_context: bool = False,
 ) -> AgentResult:
     embedding_provider = SentenceTransformerEmbedding()
     rm = LRRewardModelV3.load(rm_model_path, embedding_provider=embedding_provider)
     llm = build_llm(ollama_model, llm_cache_path)
-    agent = SqlAgent(llm=llm, rm=rm, n_candidates=n_candidates)
+    agent = SqlAgent(llm=llm, rm=rm, n_candidates=n_candidates, strip_llm_context=strip_llm_context)
     return agent.run(question, schema_context)
 
 
@@ -125,6 +135,7 @@ def main() -> None:
     parser.add_argument("--n-candidates", type=int, default=5)
     parser.add_argument("--llm-cache", type=Path, default=Path("data/output/llm_cache.json"), help="Cache LLM candidates here, keyed by (question, schema_context) — reused across RM changes")
     parser.add_argument("--no-llm-cache", action="store_true", help="Always call the LLM fresh, ignoring/skipping the cache")
+    parser.add_argument("--strip-context", action="store_true", help="Don't show the LLM schema_context when generating candidates (still used for execution) — tests unconditioned generation")
     args = parser.parse_args()
 
     if args.input:
@@ -147,6 +158,7 @@ def main() -> None:
         ollama_model=args.ollama_model,
         n_candidates=args.n_candidates,
         llm_cache_path=None if args.no_llm_cache else args.llm_cache,
+        strip_llm_context=args.strip_context,
     )
     print(json.dumps(result.to_dict(), indent=2))
 

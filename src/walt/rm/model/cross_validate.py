@@ -12,6 +12,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import random
 from pathlib import Path
 
 from walt.rm.model.base import cross_validate, load_examples, publish_cv_summary
@@ -31,6 +32,7 @@ MODEL_CHOICES = ["lr_v1", "lr_v2", "lr_v3", "lr_v3_scaled", "lr_v4", "lr_v5", "g
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--input", type=Path, default=Path("data/output/rm_enhanced.jsonl"), help="Input JSONL (question, sql_good, sql_bad, source)")
+    parser.add_argument("--train-fraction", type=float, default=1.0, help="Fraction of trainval examples to keep (question-level, seeded shuffle) before CV — for data-scaling experiments")
     parser.add_argument("--k", type=int, default=5, help="Number of cross-validation folds")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for fold assignment and pair-label randomization")
     parser.add_argument("--model", choices=MODEL_CHOICES, default="lr_v1", help="Which reward model implementation to evaluate")
@@ -54,8 +56,16 @@ def main() -> None:
     examples = load_examples(args.input)
     n_loaded = len(examples)
     examples = [ex for ex in examples if ex.split != "val"]
+    n_trainval = len(examples)
+    if args.train_fraction < 1.0:
+        rng = random.Random(args.seed)
+        shuffled = list(examples)
+        rng.shuffle(shuffled)
+        n_keep = round(len(shuffled) * args.train_fraction)
+        examples = shuffled[:n_keep]
     print(
-        f"Loaded {n_loaded} examples ({n_loaded - len(examples)} val rows excluded), "
+        f"Loaded {n_loaded} examples ({n_loaded - n_trainval} val rows excluded), "
+        f"subsampled to {len(examples)}/{n_trainval} ({args.train_fraction:.0%}) trainval rows, "
         f"running {args.k}-fold CV with model={args.model}"
     )
 
@@ -113,6 +123,7 @@ def main() -> None:
             model_class=model_factory().__class__.__name__,
             config={
                 "input": str(args.input),
+                "train_fraction": args.train_fraction,
                 "model": args.model,
                 "embedding_model": args.embedding_model,
                 "k": args.k,

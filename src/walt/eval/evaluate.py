@@ -160,6 +160,7 @@ def main() -> None:
     parser.add_argument("--output", type=Path, default=None, help="Optional path to write the JSON summary")
     parser.add_argument("--llm-cache", type=Path, default=Path("data/output/llm_cache.json"), help="Cache LLM candidates here, keyed by (question, schema_context) — so re-running with a different --rm-model reuses candidates instead of re-calling the LLM")
     parser.add_argument("--no-llm-cache", action="store_true", help="Always call the LLM fresh, ignoring/skipping the cache")
+    parser.add_argument("--strip-context", action="store_true", help="Don't show the LLM schema_context when generating candidates (still used for execution/reference) — tests unconditioned generation")
     parser.add_argument("--run-name", default=None, help="Label for this run in the run log (default: derived from --rm-model and --ollama-model)")
     parser.add_argument("--runs-dir", type=Path, default=Path("data/output/eval_runs"), help="Directory where agent-eval run records are logged for later comparison (separate from RM training's data/output/runs/ — different metric shape)")
     parser.add_argument("--no-log-run", action="store_true", help="Skip writing a run record (e.g. for throwaway/debug runs)")
@@ -181,7 +182,7 @@ def main() -> None:
 
     llm_cache_path = None if args.no_llm_cache else args.llm_cache
     llm = build_llm(args.ollama_model, llm_cache_path)
-    agent = SqlAgent(llm=llm, rm=rm, n_candidates=args.n_candidates)
+    agent = SqlAgent(llm=llm, rm=rm, n_candidates=args.n_candidates, strip_llm_context=args.strip_context)
     agent_metrics = evaluate_agent(val_examples, agent)
 
     def _print_line(label: str, stats: dict[str, Any]) -> None:
@@ -230,6 +231,7 @@ def main() -> None:
                 "ollama_model": args.ollama_model,
                 "n_candidates": args.n_candidates,
                 "n_val_examples": len(val_examples),
+                "strip_context": args.strip_context,
             },
             # Flat so a future comparison table/chart can key straight into it, same as
             # rm/model/visualize.py does for top1_accuracy/pairwise_accuracy/mrr.
