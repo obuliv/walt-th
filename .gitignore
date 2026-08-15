@@ -223,6 +223,9 @@ __marimo__/
 .DS_Store
 Thumbs.db
 
+# Anthropic batch job state (custom_id -> record mappings, in-flight batch ids)
+.batch_state/
+
 # Secrets / credentials
 *.pem
 *.key
