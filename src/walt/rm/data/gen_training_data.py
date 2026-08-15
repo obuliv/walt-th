@@ -49,6 +49,7 @@ BAD_SQL_REASONS: list[tuple[str, str]] = [
     ("wrong_filter_or_sort", "Omits or misstates a WHERE/HAVING condition, or gets ORDER BY/LIMIT wrong."),
     ("type_or_null_handling", "Compares/casts incompatible types, or mishandles NULLs (e.g. '= NULL' instead of 'IS NULL')."),
     ("syntax_error", "Malformed SQL that would fail to parse or execute."),
+    ("inefficient_query", "Produces the correct result but is needlessly inefficient (e.g. a correlated subquery instead of a join, a missing sargable predicate causing a full scan, SELECT * bloat, redundant DISTINCT/GROUP BY)."),
 ]
 REASON_NAMES = [name for name, _ in BAD_SQL_REASONS]
 
@@ -95,6 +96,17 @@ FEW_SHOT_EXAMPLES: list[dict[str, Any]] = [
                         "WHERE sale_date >= DATE_TRUNC('month', CURRENT_DATE - INTERVAL '1 month') GROUP BY category"
                     ),
                     "reason": "syntax_error",
+                },
+                {
+                    "sql": (
+                        "SELECT DISTINCT category, (SELECT SUM(price * units) FROM sales s2 "
+                        "WHERE s2.category = s.category "
+                        "AND s2.sale_date >= DATE_TRUNC('month', CURRENT_DATE - INTERVAL '1 month') "
+                        "AND s2.sale_date < DATE_TRUNC('month', CURRENT_DATE)) AS revenue "
+                        "FROM sales s WHERE sale_date >= DATE_TRUNC('month', CURRENT_DATE - INTERVAL '1 month') "
+                        "AND sale_date < DATE_TRUNC('month', CURRENT_DATE)"
+                    ),
+                    "reason": "inefficient_query",
                 },
             ],
         },
@@ -168,12 +180,18 @@ idiomatically answers the question. If it is already correct, return it unchange
 (only cosmetic cleanup, e.g. consistent aliasing, is allowed).
 2. Produce between 3 and 5 "sql_bad" examples: plausible-looking SQL queries that a \
 competent-but-imperfect model might write for the same question, each containing exactly \
-one meaningful mistake. Bad examples must be diverse (no repeated mistake type) and must be \
-*close misses* that a careless reviewer could mistake for correct — not obviously broken SQL.
+one meaningful problem — either an incorrectness issue, or (for the "inefficient_query" \
+category only) correct results reached in a needlessly costly way. Bad examples must be \
+diverse (no repeated mistake type within the same question) and must be *close misses* \
+that a careless reviewer could mistake for correct — not obviously broken SQL.
 3. Tag each sql_bad example with the single reason category from this list that best \
 explains its mistake:
 
 {_reasons_block()}
+
+Not every category needs to be represented for every question — only use the ones that \
+are natural and plausible for this specific query and schema. Don't force-fit a category \
+just to cover the list; pick whichever 3-5 distinct mistakes a real model would plausibly make here.
 
 # Examples
 
@@ -329,6 +347,25 @@ def cmd_test(args: argparse.Namespace) -> None:
 # submit: build and submit a Message Batch for every record in the input.
 # ---------------------------------------------------------------------------
 
+# https://docs.anthropic.com/en/api/creating-message-batches — limits as of writing;
+# verify against current docs if this starts failing unexpectedly.
+MAX_BATCH_REQUESTS = 100_000
+MAX_BATCH_BYTES = 256 * 1024 * 1024
+
+
+def check_batch_limits(requests: list[dict[str, Any]]) -> None:
+    if len(requests) > MAX_BATCH_REQUESTS:
+        raise ValueError(
+            f"Batch has {len(requests)} requests, which exceeds the "
+            f"{MAX_BATCH_REQUESTS}-request-per-batch limit. Split the input and submit in chunks."
+        )
+    size = len(json.dumps(requests).encode("utf-8"))
+    if size > MAX_BATCH_BYTES:
+        raise ValueError(
+            f"Batch payload is {size / 1024 / 1024:.1f} MB, which exceeds the "
+            f"{MAX_BATCH_BYTES / 1024 / 1024:.0f} MB per-batch limit. Split the input and submit in chunks."
+        )
+
 
 def state_path(batch_id: str) -> Path:
     return STATE_DIR / f"{batch_id}.json"
@@ -370,6 +407,8 @@ def cmd_submit(args: argparse.Namespace) -> None:
             }
         )
         records_by_custom_id[custom_id] = record
+
+    check_batch_limits(requests)
 
     batch = client.messages.batches.create(requests=requests)
     save_state(batch.id, args.input, records_by_custom_id)
