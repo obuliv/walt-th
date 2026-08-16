@@ -37,7 +37,7 @@ import anthropic
 import jsonschema
 from dotenv import load_dotenv
 
-from walt.utils.sql_exec import run_sql
+from walt.utils.sql_exec import clean_context, run_sql
 
 load_dotenv()
 
@@ -597,6 +597,9 @@ def enhance_record(record: dict[str, Any], result: dict[str, Any]) -> dict[str, 
     # sql_context (freshly synthesized, or reused as-is when the row already had one)?
     execution = run_sql(merged.get("sql_context", []), merged["sql_good"])
     merged["sql_context_valid"] = execution.success
+    # Schema-only view (CREATE TABLE etc, no INSERT rows) — what the LLM/RM should see
+    # instead of the full context (see clean_context()).
+    merged["sql_context_clean"] = list(clean_context(merged.get("sql_context", [])))
     return merged
 
 

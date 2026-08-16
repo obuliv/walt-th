@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
 
+from walt.utils.sql_exec import clean_context
+
 
 @dataclass(frozen=True)
 class SQLBadCandidate:
@@ -27,6 +29,7 @@ class Example:
     source: str
     sql_bad: tuple[SQLBadCandidate, ...] = ()
     sql_context: tuple[str, ...] = ()
+    sql_context_clean: tuple[str, ...] = ()  # sql_context with INSERT statements stripped — see clean_context()
     sql_context_valid: bool | None = None
     split: str = "trainval"  # "trainval" | "val" — RM training/CV never sees "val" rows
 
@@ -45,6 +48,8 @@ class Example:
             d["sql_bad"] = [b.to_dict() for b in self.sql_bad]
         if self.sql_context:
             d["sql_context"] = list(self.sql_context)
+        if self.sql_context_clean:
+            d["sql_context_clean"] = list(self.sql_context_clean)
         if self.sql_context_valid is not None:
             d["sql_context_valid"] = self.sql_context_valid
         return d
@@ -53,12 +58,18 @@ class Example:
     def from_dict(d: dict) -> "Example":
         sql_bad = tuple(SQLBadCandidate.from_dict(b) for b in d.get("sql_bad", []))
         sql_context = tuple(d.get("sql_context", []))
+        # Fall back to computing it for rows written before sql_context_clean existed,
+        # so older enhanced JSONL files keep working without regenerating them.
+        sql_context_clean = (
+            tuple(d["sql_context_clean"]) if "sql_context_clean" in d else clean_context(sql_context)
+        )
         return Example(
             question=d["question"],
             sql_good=d["sql_good"],
             source=d["source"],
             sql_bad=sql_bad,
             sql_context=sql_context,
+            sql_context_clean=sql_context_clean,
             sql_context_valid=d.get("sql_context_valid"),
             split=d.get("split", "trainval"),
         )

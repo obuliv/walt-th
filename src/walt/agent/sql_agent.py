@@ -16,11 +16,12 @@ from typing import Any
 
 from walt.agent.llm.base import BaseLLM
 from walt.agent.llm.caching_llm import CachingLLM
+from walt.agent.llm.claude_llm import ClaudeLLM
 from walt.agent.llm.ollama_llm import OllamaLLM
 from walt.rm.model.base import BaseRewardModel, ScoredCandidate
 from walt.rm.model.embeddings import SentenceTransformerEmbedding
-from walt.rm.model.lr.lr_model_v3 import LRRewardModelV3
-from walt.utils.sql_exec import ExecutionResult, run_sql
+from walt.rm.model.lr.lr_model_v6 import LRRewardModelV6
+from walt.utils.sql_exec import ExecutionResult, clean_context, run_sql
 
 
 @dataclass(frozen=True)
@@ -82,11 +83,15 @@ class SqlAgent:
         self.strip_llm_context = strip_llm_context
 
     def run(self, question: str, schema_context: list[str]) -> AgentResult:
-        llm_context = "" if self.strip_llm_context else "\n".join(schema_context)
+        # LLM/RM see only the schema (CREATE TABLE etc, no INSERT rows) — sample data is
+        # noise for "does this candidate SQL fit the schema", and is only needed below
+        # for actually executing the chosen candidate.
+        clean_schema = clean_context(schema_context)
+        llm_context = "" if self.strip_llm_context else "\n".join(clean_schema)
         candidates = self.llm.generate_candidates(question, llm_context, self.n_candidates)
         if not candidates:
             raise RuntimeError(f"LLM produced no candidate SQL for question: {question!r}")
-        scored = self.rm.rank(question, candidates, sql_context=tuple(schema_context))
+        scored = self.rm.rank(question, candidates, sql_context=clean_schema)
         best = scored[0]
         execution = run_sql(schema_context, best.sql)
         return AgentResult(
@@ -100,8 +105,17 @@ class SqlAgent:
         )
 
 
-def build_llm(ollama_model: str, llm_cache_path: str | Path | None) -> BaseLLM:
-    llm: BaseLLM = OllamaLLM(model=ollama_model)
+def build_llm(model: str, llm_cache_path: str | Path | None, backend: str = "ollama") -> BaseLLM:
+    """backend selects the candidate-generating LLM: "ollama" (default, local
+    OllamaLLM — model is e.g. "llama3.2") or "claude" (ClaudeLLM via the Anthropic API
+    — model is e.g. "claude-haiku-4-5-20251001", requires ANTHROPIC_API_KEY)."""
+    llm: BaseLLM
+    if backend == "claude":
+        llm = ClaudeLLM(model=model)
+    elif backend == "ollama":
+        llm = OllamaLLM(model=model)
+    else:
+        raise ValueError(f"Unknown llm backend: {backend!r} (expected 'ollama' or 'claude')")
     if llm_cache_path is not None:
         llm = CachingLLM(llm, cache_path=llm_cache_path)
     return llm
@@ -113,13 +127,14 @@ def run_agent(
     *,
     rm_model_path: str | Path = "data/output/rm_model.joblib",
     ollama_model: str = "llama3.2",
+    llm_backend: str = "ollama",
     n_candidates: int = 5,
     llm_cache_path: str | Path | None = "data/output/llm_cache.json",
     strip_llm_context: bool = False,
 ) -> AgentResult:
     embedding_provider = SentenceTransformerEmbedding()
-    rm = LRRewardModelV3.load(rm_model_path, embedding_provider=embedding_provider)
-    llm = build_llm(ollama_model, llm_cache_path)
+    rm = LRRewardModelV6.load(rm_model_path, embedding_provider=embedding_provider)
+    llm = build_llm(ollama_model, llm_cache_path, backend=llm_backend)
     agent = SqlAgent(llm=llm, rm=rm, n_candidates=n_candidates, strip_llm_context=strip_llm_context)
     return agent.run(question, schema_context)
 

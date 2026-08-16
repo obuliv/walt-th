@@ -96,8 +96,8 @@ class LRRewardModel(BaseRewardModel):
                     a_sql, b_sql, label = ex.sql_good, bad.sql, 1
                 else:
                     a_sql, b_sql, label = bad.sql, ex.sql_good, 0
-                phi_a = self._phi(ex.question, a_sql, ex.sql_context)
-                phi_b = self._phi(ex.question, b_sql, ex.sql_context)
+                phi_a = self._phi(ex.question, a_sql, ex.sql_context_clean)
+                phi_b = self._phi(ex.question, b_sql, ex.sql_context_clean)
                 X_rows.append(phi_a - phi_b)
                 y_rows.append(label)
 

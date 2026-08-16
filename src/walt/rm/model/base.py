@@ -120,14 +120,14 @@ class BaseRewardModel(ABC):
         reason_total: dict[str, int] = {}
 
         for ex in test_examples:
-            ranked = self.rank(ex.question, all_candidates(ex), ex.sql_context)
+            ranked = self.rank(ex.question, all_candidates(ex), ex.sql_context_clean)
             good_rank = next(r.rank for r in ranked if r.sql == ex.sql_good)
             top1_hits += int(good_rank == 1)
             rr_sum += 1.0 / good_rank
 
-            good_score = self.score(ex.question, ex.sql_good, ex.sql_context)
+            good_score = self.score(ex.question, ex.sql_good, ex.sql_context_clean)
             for bad in ex.sql_bad:
-                bad_score = self.score(ex.question, bad.sql, ex.sql_context)
+                bad_score = self.score(ex.question, bad.sql, ex.sql_context_clean)
                 pair_total += 1
                 correct = int(good_score > bad_score)
                 pair_correct += correct

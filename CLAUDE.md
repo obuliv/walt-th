@@ -81,10 +81,11 @@ uv run python -m walt.rm.data.fix_sql_bad collect --batch-id msgbatch_xxx --outp
 
 Train a pairwise-ranking reward model on `rm_enhanced.jsonl`, evaluate on a held-out
 split, and check the train/test gap for overfitting (`--model` selects `lr_v1`/`lr_v2`/
-`lr_v3`/`lr_v4`/`lr_v5`/`gbm`/`distilbert` — v4/v5 also consume `sql_context`, see
-Architecture below for why neither beats v3, and `distilbert` fine-tunes
+`lr_v3`/`lr_v4`/`lr_v5`/`lr_v6`/`gbm`/`distilbert` — v4/v5 also consume `sql_context`,
+see Architecture below for why neither beats v3, and `distilbert` fine-tunes
 `distilbert-base-cased` end to end via `--distilbert-*` flags, also not beating v3 —
-default `lr_v3` with `--C 30`; see Architecture below for why):
+default `lr_v6` (v3 + a schema-validity feature) with `--C 30`, `--C` still tuned for
+v3 not re-swept for v6; see Architecture below for why):
 ```bash
 uv run python -m walt.rm.model.train \
   --input data/output/rm_enhanced.jsonl \
@@ -659,3 +660,79 @@ enrichment call, unaware of that candidate, added data that didn't happen to fal
 boundary) — closing that fully would mean re-verifying `sql_bad` after enrichment too,
 which `fix_sql_bad.py` above already does generically and can be re-run on any future
 output if needed, so it wasn't duplicated here.
+
+**`LRRewardModelV6` — a schema-validity feature closes most of the agent's RM-transfer
+gap, now the default everywhere (2026-08-16).** The RM-doesn't-transfer finding above
+traced to a distribution mismatch: `is_sql_valid` (pure syntax, `sql_features.py`)
+essentially never fires on `llama3.2`'s actual mistakes, because its candidates almost
+always parse fine — the real failure mode is referencing a table/column that doesn't
+exist in the schema, a class of error pure-syntax checking can't see and the four
+synthetic `sql_bad` mistake categories never model either.
+`is_schema_valid(sql, sql_context)` (`sql_features.py`) targets this directly: executes
+`sql` against `sql_context`'s schema via `run_sql`, cached on `(sql, sql_context)`.
+`sql_context` here is expected to be the clean, data-free `CREATE TABLE`-only context
+(`clean_context()`, see below), not the full context with sample rows — otherwise a
+legitimate query could spuriously "fail" on a data-only constraint (e.g. a UNIQUE
+conflict on inserted rows) that has nothing to do with whether the query itself is
+well-formed for the schema. No context at all (e.g. `sql_good` is itself DDL) is
+treated as valid/neutral. `LRRewardModelV6` (`lr_model_v6.py`) is `lr_v3`'s phi plus
+this one feature — cheap, no embedding call, same pattern as `is_sql_valid` itself.
+
+(Aside: `Example.sql_context_clean` — `sql_context` with `INSERT` statements stripped
+via `clean_context()`, sqlite-`INSERT` statements identified via `sqlglot` — was added
+earlier the same day so the LLM candidate generator and the RM both see only the
+schema, not sample-data noise; `fit()`/`evaluate()` and `sql_agent.py`'s `run()` all
+use it in place of the full `sql_context` for everything except actual execution, which
+still needs the real data.)
+
+On synthetic `sql_bad` pairwise accuracy (5-fold CV, `C=1000`, gretel-only) the feature
+barely moves the needle — plain gretel top1 0.5731 vs `lr_v3`'s 0.5725, gretel_opus
+(see below) 0.5918 vs 0.5829 — expected, since the synthetic negatives were written to
+reference real schema elements, just with wrong logic. The win is entirely at the
+agent level, where `llama3.2`'s actual candidates do hallucinate schema: on
+gretel_opus's val split, SQL execution pass rate with RM reranking jumped from 76.6%
+(`lr_v3`, *worse* than the 85.8% no-rerank baseline) to 96.5% (*better* than baseline);
+QA accuracy's with/without-RM gap shrank from -5.6pp to -1.4pp; and the mixed-bucket
+(selection-matters) achieved rate flipped from below random-chance expectation (37.3%
+vs 45.1%) to above it (49.0%). Reproduced on plain gretel too (SQL pass 80.3%→97.3% vs
+an 86.4% baseline, mixed-bucket 39.6%→50.0% vs 46.2% chance) — not a
+gretel_opus-specific artifact. `sql_agent.py`'s `run_agent()`, `evaluate.py`'s
+`--rm-class`, and `train.py`/`cross_validate.py`'s `--model` now all default to
+`lr_v6`.
+
+**`lr_v6` `C` re-swept on gretel-only data (2026-08-16): `C=300`, not the inherited
+`lr_v3` defaults of `30`/`1000`.** Same sweep methodology as the original `lr_v3`
+sweeps (5-fold CV, `C` from 1 to 30000), run separately on `gretel_opus` and plain
+gretel. Both plateau over roughly the same `C=100`-`30000` range as `lr_v3` did, but
+the peak sits lower this time: `gretel_opus` peaks at `C=300` (top1 0.5993±0.0266,
+pairwise 0.8791±0.0077, mrr 0.7766±0.0141), plain gretel peaks at `C=100` (top1
+0.5863±0.0322) with `C=300` a close second (0.5791±0.0335) — close enough between the
+two datasets' peaks (within ~1pp, inside fold noise) that a single shared value beats
+splitting by dataset, and `C=300` is the better shared pick since it's gretel_opus's
+actual peak and only marginally off plain gretel's. Both `train.py` and
+`cross_validate.py` now default to `--C 300`. This beats the old inherited default
+(`C=30`, tuned for `lr_v3` on spider/dbasql) by a consistent +1.7-1.8pp top1 on both
+datasets — a real gain, not noise. Not yet swept on the combined spider/dbasql+gretel
+pool (`lr_v3`'s other tuned point, `C=1000`, was for that larger dataset) — if `lr_v6`
+is ever trained on the combined set, `C` should be re-swept there too rather than
+assuming `300` transfers.
+
+QA accuracy with RM reranking still trails the no-rerank baseline by a small margin on
+both datasets (39.7% vs 41.1% gretel_opus, 40.1% vs 41.5% plain gretel) —
+`is_schema_valid` fixes "does the picked SQL even execute" almost completely but says
+nothing about whether its logic is actually correct, so a schema-valid-but-wrong-answer
+candidate can still outrank a correct one. Not addressed here.
+
+**`gretel_opus` (2026-08-16)** is the same gretel pipeline above, run a second time with
+`ANTHROPIC_MODEL=claude-opus-5` instead of the default `claude-sonnet-5`, output kept
+separate under `data/output/gretel_opus/` (never overwrites the Sonnet-generated
+`data/output/gretel/`) so the two are directly comparable. `gen_training_data.py`
+bad-only mode against the same 1,668 llm-ready rows: 1,601 succeeded (67 failed tool
+validation, same "occasionally omits a required field" gap seen with Sonnet, just a
+different nested-shape failure mode). Pre-`fix_sql_bad.py`, Opus's negatives were
+already more distinguishing than Sonnet's on the same data (68.3% rows / 26.5%
+candidates flagged vs Sonnet's 80.8% / 42.7%); post-fix, 21.1% / 5.7% vs Sonnet's
+27.0% / 8.7%. `lr_v3`/`C=1000` CV on `gretel_opus` beats plain gretel on all three
+headline metrics (top1 0.5829±0.0219 vs 0.5725±0.0330, pairwise 0.8778±0.0082 vs
+0.8625±0.0140, mrr 0.7703±0.0128 vs 0.7642±0.0205) — a real but modest gain, smaller
+than `lr_v6`'s agent-level effect above.

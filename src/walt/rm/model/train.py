@@ -1,10 +1,13 @@
 """Trains a pairwise-ranking reward model on rm_enhanced.jsonl, evaluates it on a
 held-out question-level split, and checks the train/test gap for overfitting.
 
-Defaults (--model lr_v3, --C 30) reflect the best config found via 5-fold CV
-(see cross_validate.py and CLAUDE.md) — cosine-sim + is_sql_valid features, and much
-less L2 regularization than sklearn's C=1.0 default, which was clearly under-using the
-model's capacity for this data size (~4700 training pairs, 769-770 features).
+Defaults (--model lr_v6, --C 300) reflect the best config found via 5-fold CV
+(see cross_validate.py and CLAUDE.md) — cosine-sim + is_sql_valid + is_schema_valid
+features, and much less L2 regularization than sklearn's C=1.0 default, which was
+clearly under-using the model's capacity for this data size (~4700 training pairs,
+769-770 features). --C 300 is CV-tuned for lr_v6 on gretel-only data specifically
+(peaks around C=100-300 there, unlike lr_v3's C=30/C=1000 tuned on other datasets)
+— see CLAUDE.md.
 
 Usage:
     python -m walt.rm.model.train --input data/output/rm_enhanced.jsonl --model-output data/output/rm_model.joblib
@@ -21,10 +24,10 @@ from walt.rm.model.distilbert_model import DEFAULT_MODEL_NAME as DISTILBERT_DEFA
 from walt.rm.model.distilbert_model import DistilBertRewardModel
 from walt.rm.model.embeddings import SentenceTransformerEmbedding
 from walt.rm.model.gbm_model import GBMRewardModel
-from walt.rm.model.lr import LRRewardModel, LRRewardModelV2, LRRewardModelV3, LRRewardModelV4, LRRewardModelV5
+from walt.rm.model.lr import LRRewardModel, LRRewardModelV2, LRRewardModelV3, LRRewardModelV4, LRRewardModelV5, LRRewardModelV6
 from walt.rm.model.tracking import log_run
 
-MODEL_CHOICES = ["lr_v1", "lr_v2", "lr_v3", "lr_v4", "lr_v5", "gbm", "distilbert"]
+MODEL_CHOICES = ["lr_v1", "lr_v2", "lr_v3", "lr_v4", "lr_v5", "lr_v6", "gbm", "distilbert"]
 
 
 def main() -> None:
@@ -32,7 +35,7 @@ def main() -> None:
     parser.add_argument("--input", type=Path, default=Path("data/output/rm_enhanced.jsonl"), help="Input JSONL (question, sql_good, sql_bad, source)")
     parser.add_argument("--test-size", type=float, default=0.2, help="Fraction of questions held out for evaluation")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for splitting and pair-label randomization")
-    parser.add_argument("--model", choices=MODEL_CHOICES, default="lr_v3", help="Which reward model implementation to train")
+    parser.add_argument("--model", choices=MODEL_CHOICES, default="lr_v6", help="Which reward model implementation to train")
     parser.add_argument("--embedding-model", default=SentenceTransformerEmbedding.DEFAULT_MODEL_NAME, help="sentence-transformers model name/id")
     parser.add_argument("--device", default=None, help="Torch device for the embedding model (e.g. 'mps', 'cpu'); default lets sentence-transformers auto-select")
     parser.add_argument("--model-output", type=Path, default=Path("data/output/rm_model.joblib"), help="Where to save the fitted model")
@@ -40,7 +43,7 @@ def main() -> None:
     parser.add_argument("--run-name", default=None, help="Label for this run in the run log (default: derived from --model and the embedding model name)")
     parser.add_argument("--runs-dir", type=Path, default=Path("data/output/runs"), help="Directory where per-run metric records are logged for later comparison")
     parser.add_argument("--no-log-run", action="store_true", help="Skip writing a run record (e.g. for throwaway/debug runs)")
-    parser.add_argument("--C", type=float, default=30.0, help="[lr_v1/lr_v2/lr_v3 only] LogisticRegression inverse regularization strength (CV-tuned; sklearn's own default is 1.0)")
+    parser.add_argument("--C", type=float, default=300.0, help="[lr_v1/lr_v2/.../lr_v6 only] LogisticRegression inverse regularization strength — 300 is CV-tuned for lr_v6 on gretel-only data (sklearn's own default is 1.0); other models/datasets were tuned separately, see CLAUDE.md")
     parser.add_argument("--v2-cosine-sim", dest="v2_cosine_sim", action=argparse.BooleanOptionalAction, default=True, help="[lr_v2 only] include the cosine-similarity interaction feature")
     parser.add_argument("--v2-dot-product", dest="v2_dot_product", action=argparse.BooleanOptionalAction, default=True, help="[lr_v2 only] include the raw dot-product interaction feature")
     parser.add_argument("--v2-standardize-dot", dest="v2_standardize_dot", action=argparse.BooleanOptionalAction, default=True, help="[lr_v2 only] standardize the raw dot-product feature using training-set mean/std")
@@ -91,6 +94,8 @@ def main() -> None:
         model = LRRewardModelV4(embedding_provider=embedding_provider, seed=args.seed, C=args.C)
     elif args.model == "lr_v5":
         model = LRRewardModelV5(embedding_provider=embedding_provider, seed=args.seed, C=args.C)
+    elif args.model == "lr_v6":
+        model = LRRewardModelV6(embedding_provider=embedding_provider, seed=args.seed, C=args.C)
     elif args.model == "distilbert":
         model = DistilBertRewardModel(
             model_name=args.distilbert_model_name,
@@ -162,7 +167,7 @@ def main() -> None:
                 "n_train": len(train_examples),
                 "n_test": len(test_examples),
                 **load_stats,  # n_rows_total, n_rows_skipped
-                **({"C": args.C} if args.model in ("lr_v1", "lr_v2", "lr_v3", "lr_v4", "lr_v5") else {}),
+                **({"C": args.C} if args.model in ("lr_v1", "lr_v2", "lr_v3", "lr_v4", "lr_v5", "lr_v6") else {}),
                 **(
                     {
                         "v2_cosine_sim": args.v2_cosine_sim,

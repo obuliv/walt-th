@@ -7,10 +7,14 @@ candidate.
 """
 from __future__ import annotations
 
+import functools
 import sqlite3
 from collections import Counter
 from dataclasses import dataclass
 from typing import Sequence
+
+import sqlglot
+import sqlglot.expressions as exp
 
 
 @dataclass(frozen=True)
@@ -19,6 +23,26 @@ class ExecutionResult:
     columns: tuple[str, ...] | None
     rows: tuple[tuple, ...] | None
     error: str | None
+
+
+@functools.lru_cache(maxsize=None)
+def _is_insert(statement: str) -> bool:
+    try:
+        return isinstance(sqlglot.parse_one(statement, dialect="sqlite"), exp.Insert)
+    except Exception:
+        # Same lenient fallback as gretel.py's split_sql_context — a handful of context
+        # statements use syntax sqlglot's sqlite dialect rejects.
+        return statement.strip().upper().startswith("INSERT")
+
+
+def clean_context(context_statements: Sequence[str]) -> tuple[str, ...]:
+    """Drops INSERT statements from context_statements, keeping only schema-defining
+    ones (CREATE TABLE and any other non-INSERT statement, e.g. CREATE VIEW/INDEX) — the
+    schema an LLM/RM needs to reason about a query, without the sample-data noise that
+    isn't relevant to whether a candidate SQL query is well-formed for that schema.
+    Sample data is still needed for execution/QA-accuracy checks, so callers that
+    execute SQL should keep using the original context_statements, not this."""
+    return tuple(s for s in context_statements if not _is_insert(s))
 
 
 def run_sql(context_statements: Sequence[str], sql: str, timeout: float = 5.0) -> ExecutionResult:

@@ -27,10 +27,11 @@ from walt.rm.model.lr import (
     LRRewardModelV3Scaled,
     LRRewardModelV4,
     LRRewardModelV5,
+    LRRewardModelV6,
 )
 from walt.rm.model.tracking import log_run
 
-MODEL_CHOICES = ["lr_v1", "lr_v2", "lr_v3", "lr_v3_scaled", "lr_v4", "lr_v5", "gbm"]
+MODEL_CHOICES = ["lr_v1", "lr_v2", "lr_v3", "lr_v3_scaled", "lr_v4", "lr_v5", "lr_v6", "gbm"]
 
 
 def main() -> None:
@@ -39,10 +40,10 @@ def main() -> None:
     parser.add_argument("--train-fraction", type=float, default=1.0, help="Fraction of trainval examples to keep (question-level, seeded shuffle) before CV — for data-scaling experiments")
     parser.add_argument("--k", type=int, default=5, help="Number of cross-validation folds")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for fold assignment and pair-label randomization")
-    parser.add_argument("--model", choices=MODEL_CHOICES, default="lr_v1", help="Which reward model implementation to evaluate")
+    parser.add_argument("--model", choices=MODEL_CHOICES, default="lr_v6", help="Which reward model implementation to evaluate")
     parser.add_argument("--embedding-model", default=SentenceTransformerEmbedding.DEFAULT_MODEL_NAME, help="sentence-transformers model name/id")
     parser.add_argument("--device", default=None, help="Torch device for the embedding model")
-    parser.add_argument("--C", type=float, default=1.0, help="[lr_v1/lr_v2/lr_v3 only] LogisticRegression inverse regularization strength")
+    parser.add_argument("--C", type=float, default=300.0, help="[lr_v1/lr_v2/.../lr_v6 only] LogisticRegression inverse regularization strength — 300 is CV-tuned for lr_v6 on gretel-only data (sklearn's own default is 1.0); other models/datasets were tuned separately, see CLAUDE.md")
     parser.add_argument("--penalty", choices=sorted(SOLVER_BY_PENALTY), default="l2", help="[lr_v1/lr_v2/lr_v3/lr_v3_scaled only] LogisticRegression penalty type")
     parser.add_argument("--l1-ratio", type=float, default=None, help="[penalty=elasticnet only] elastic-net mixing parameter in [0,1] (0=l2, 1=l1)")
     parser.add_argument("--v2-cosine-sim", dest="v2_cosine_sim", action=argparse.BooleanOptionalAction, default=True, help="[lr_v2 only]")
@@ -95,6 +96,8 @@ def main() -> None:
             return LRRewardModelV4(embedding_provider=embedding_provider, seed=args.seed, C=args.C, penalty=args.penalty, l1_ratio=args.l1_ratio)
         if args.model == "lr_v5":
             return LRRewardModelV5(embedding_provider=embedding_provider, seed=args.seed, C=args.C, penalty=args.penalty, l1_ratio=args.l1_ratio)
+        if args.model == "lr_v6":
+            return LRRewardModelV6(embedding_provider=embedding_provider, seed=args.seed, C=args.C, penalty=args.penalty, l1_ratio=args.l1_ratio)
         if args.model == "lr_v3_scaled":
             return LRRewardModelV3Scaled(
                 embedding_provider=embedding_provider,

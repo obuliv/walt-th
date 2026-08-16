@@ -33,16 +33,30 @@ from walt.rm.model.base import load_examples
 from walt.rm.model.distilbert_model import DistilBertRewardModel
 from walt.rm.model.embeddings import SentenceTransformerEmbedding
 from walt.rm.model.lr.lr_model_v3 import LRRewardModelV3
+from walt.rm.model.lr.lr_model_v6 import LRRewardModelV6
 from walt.rm.model.tracking import log_run
 
-RM_CLASS_CHOICES = ["lr_v3", "distilbert"]
+RM_CLASS_CHOICES = ["lr_v3", "lr_v6", "distilbert"]
+RM_CLASS_BY_NAME = {"lr_v3": LRRewardModelV3, "lr_v6": LRRewardModelV6}
 from walt.utils.sql_exec import ExecutionResult, run_sql
 
 
+def _row_sort_key(row: tuple) -> tuple:
+    # sorted() on raw SQL rows can raise TypeError if a column mixes None with a
+    # comparable type across rows (e.g. one row's value is None, another's is a float,
+    # at the same position) — None doesn't order against non-None in Python 3. Encode
+    # "is this None" as a leading bool per value so every row sorts against every other
+    # without ever comparing None to a non-None value directly.
+    return tuple((v is None, v) if v is not None else (True, "") for v in row)
+
+
 def _rows_match(a: ExecutionResult, b: ExecutionResult) -> bool:
-    if a.columns != b.columns:
-        return False
-    return sorted(a.rows or ()) == sorted(b.rows or ())
+    # Deliberately ignores a.columns/b.columns: SQLite auto-labels a result column from
+    # the expression text itself when there's no explicit alias (e.g. `AVG(Age)` vs
+    # `AVG(T1.Age)` for a table-qualified rewrite of the same column) — column *names*
+    # are cosmetic, not part of whether the agent got the right answer. Only the actual
+    # row values (and their count/order within a row) are compared.
+    return sorted(a.rows or (), key=_row_sort_key) == sorted(b.rows or (), key=_row_sort_key)
 
 
 def _rate(count: int, total: int) -> dict[str, Any]:
@@ -157,15 +171,17 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--input", type=Path, default=Path("data/output/rm_enhanced.jsonl"))
     parser.add_argument("--rm-model", type=Path, default=Path("data/output/rm_model.joblib"))
-    parser.add_argument("--rm-class", choices=RM_CLASS_CHOICES, default="lr_v3", help="Which BaseRewardModel subclass --rm-model was saved from")
-    parser.add_argument("--ollama-model", default="llama3.2")
+    parser.add_argument("--rm-class", choices=RM_CLASS_CHOICES, default="lr_v6", help="Which BaseRewardModel subclass --rm-model was saved from")
+    parser.add_argument("--llm-backend", choices=["ollama", "claude"], default="ollama", help="Which LLM generates candidate SQL: local Ollama (default) or the Anthropic API (Claude)")
+    parser.add_argument("--ollama-model", default="llama3.2", help="Model name when --llm-backend ollama")
+    parser.add_argument("--claude-model", default="claude-haiku-4-5-20251001", help="Model name when --llm-backend claude (requires ANTHROPIC_API_KEY)")
     parser.add_argument("--n-candidates", type=int, default=5)
     parser.add_argument("--limit", type=int, default=None, help="Only evaluate the first N val rows (smoke testing)")
     parser.add_argument("--output", type=Path, default=None, help="Optional path to write the JSON summary")
-    parser.add_argument("--llm-cache", type=Path, default=Path("data/output/llm_cache.json"), help="Cache LLM candidates here, keyed by (question, schema_context) — so re-running with a different --rm-model reuses candidates instead of re-calling the LLM")
+    parser.add_argument("--llm-cache", type=Path, default=None, help="Cache LLM candidates here, keyed by (question, schema_context) — so re-running with a different --rm-model reuses candidates instead of re-calling the LLM. Defaults to data/output/llm_cache.json for --llm-backend ollama, data/output/llm_cache_claude.json for --llm-backend claude — separate files so switching backends never overwrites the other's cached candidates")
     parser.add_argument("--no-llm-cache", action="store_true", help="Always call the LLM fresh, ignoring/skipping the cache")
     parser.add_argument("--strip-context", action="store_true", help="Don't show the LLM schema_context when generating candidates (still used for execution/reference) — tests unconditioned generation")
-    parser.add_argument("--run-name", default=None, help="Label for this run in the run log (default: derived from --rm-model and --ollama-model)")
+    parser.add_argument("--run-name", default=None, help="Label for this run in the run log (default: derived from --rm-model and the LLM model)")
     parser.add_argument("--runs-dir", type=Path, default=Path("data/output/eval_runs"), help="Directory where agent-eval run records are logged for later comparison (separate from RM training's data/output/runs/ — different metric shape)")
     parser.add_argument("--no-log-run", action="store_true", help="Skip writing a run record (e.g. for throwaway/debug runs)")
     args = parser.parse_args()
@@ -180,15 +196,22 @@ def main() -> None:
         rm = DistilBertRewardModel.load(args.rm_model)
     else:
         embedding_provider = SentenceTransformerEmbedding()
-        rm = LRRewardModelV3.load(args.rm_model, embedding_provider=embedding_provider)
+        rm = RM_CLASS_BY_NAME[args.rm_class].load(args.rm_model, embedding_provider=embedding_provider)
     rm.warm_cache(val_examples)
 
     rm_metrics = rm.evaluate(val_examples)
     print("\n1. RM accuracy (sql_good vs sql_bad):")
     rm.publish_metrics(rm_metrics)
 
-    llm_cache_path = None if args.no_llm_cache else args.llm_cache
-    llm = build_llm(args.ollama_model, llm_cache_path)
+    llm_model = args.claude_model if args.llm_backend == "claude" else args.ollama_model
+    if args.no_llm_cache:
+        llm_cache_path = None
+    elif args.llm_cache is not None:
+        llm_cache_path = args.llm_cache
+    else:
+        default_cache_name = "llm_cache_claude.json" if args.llm_backend == "claude" else "llm_cache.json"
+        llm_cache_path = Path("data/output") / default_cache_name
+    llm = build_llm(llm_model, llm_cache_path, backend=args.llm_backend)
     agent = SqlAgent(llm=llm, rm=rm, n_candidates=args.n_candidates, strip_llm_context=args.strip_context)
     agent_metrics = evaluate_agent(val_examples, agent)
 
@@ -227,16 +250,17 @@ def main() -> None:
         print(f"\nWrote summary to {args.output}")
 
     if not args.no_log_run:
-        run_name = args.run_name or f"{args.rm_model.stem}_{args.ollama_model}"
+        run_name = args.run_name or f"{args.rm_model.stem}_{args.llm_backend}_{llm_model}"
         run_path = log_run(
             args.runs_dir,
             run_name=run_name,
-            model_class=f"{type(rm).__name__}+{args.ollama_model}",
+            model_class=f"{type(rm).__name__}+{args.llm_backend}:{llm_model}",
             config={
                 "input": str(args.input),
                 "rm_model": str(args.rm_model),
                 "rm_class": args.rm_class,
-                "ollama_model": args.ollama_model,
+                "llm_backend": args.llm_backend,
+                "llm_model": llm_model,
                 "n_candidates": args.n_candidates,
                 "n_val_examples": len(val_examples),
                 "strip_context": args.strip_context,
