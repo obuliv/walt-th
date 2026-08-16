@@ -233,6 +233,7 @@ Thumbs.db
 # Raw gretelai/synthetic_text_to_sql parquet cache (downloaded by build_gretel_dataset.py;
 # too large to track, and trivially re-downloadable) — the sampled JSONL output is committed.
 data/gretel/
+data/output/runs/
 
 # Secrets / credentials
 *.pem
