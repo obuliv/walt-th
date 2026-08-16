@@ -13,13 +13,21 @@ from walt.utils.sql_exec import clean_context
 class SQLBadCandidate:
     sql: str
     reason: str
+    # 0-5, only populated by walt.rm.data.synth.enhance_severity_dataset: 0 = executes
+    # to the same result as sql_good (non-distinguishing), 1 = low severity, 5 = high
+    # severity. None on every other source/pipeline — see LRRewardModel.fit()'s
+    # effective-rank rule for how each case is trained on.
+    severity: int | None = None
 
     @staticmethod
     def from_dict(d: dict) -> "SQLBadCandidate":
-        return SQLBadCandidate(sql=d["sql"], reason=d["reason"])
+        return SQLBadCandidate(sql=d["sql"], reason=d["reason"], severity=d.get("severity"))
 
     def to_dict(self) -> dict:
-        return {"sql": self.sql, "reason": self.reason}
+        d = {"sql": self.sql, "reason": self.reason}
+        if self.severity is not None:
+            d["severity"] = self.severity
+        return d
 
 
 @dataclass(frozen=True)

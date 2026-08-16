@@ -44,6 +44,7 @@ def main() -> None:
     parser.add_argument("--runs-dir", type=Path, default=Path("data/output/runs"), help="Directory where per-run metric records are logged for later comparison")
     parser.add_argument("--no-log-run", action="store_true", help="Skip writing a run record (e.g. for throwaway/debug runs)")
     parser.add_argument("--C", type=float, default=300.0, help="[lr_v1/lr_v2/.../lr_v6 only] LogisticRegression inverse regularization strength — 300 is CV-tuned for lr_v6 on gretel-only data (sklearn's own default is 1.0); other models/datasets were tuned separately, see CLAUDE.md")
+    parser.add_argument("--severity-zero-as-positive", action="store_true", help="[lr_v1/lr_v3/lr_v4/lr_v5/lr_v6 only] treat severity==0 sql_bad candidates (from enhance_severity_dataset.py) as extra positive anchors paired against every real bad, instead of excluding them from every pair. No-op on datasets without severity.")
     parser.add_argument("--v2-cosine-sim", dest="v2_cosine_sim", action=argparse.BooleanOptionalAction, default=True, help="[lr_v2 only] include the cosine-similarity interaction feature")
     parser.add_argument("--v2-dot-product", dest="v2_dot_product", action=argparse.BooleanOptionalAction, default=True, help="[lr_v2 only] include the raw dot-product interaction feature")
     parser.add_argument("--v2-standardize-dot", dest="v2_standardize_dot", action=argparse.BooleanOptionalAction, default=True, help="[lr_v2 only] standardize the raw dot-product feature using training-set mean/std")
@@ -78,7 +79,7 @@ def main() -> None:
         None if args.model == "distilbert" else SentenceTransformerEmbedding(model_name=args.embedding_model, device=args.device)
     )
     if args.model == "lr_v1":
-        model = LRRewardModel(embedding_provider=embedding_provider, seed=args.seed, C=args.C)
+        model = LRRewardModel(embedding_provider=embedding_provider, seed=args.seed, C=args.C, severity_zero_as_positive=args.severity_zero_as_positive)
     elif args.model == "lr_v2":
         model = LRRewardModelV2(
             embedding_provider=embedding_provider,
@@ -89,13 +90,13 @@ def main() -> None:
             standardize_dot_product=args.v2_standardize_dot,
         )
     elif args.model == "lr_v3":
-        model = LRRewardModelV3(embedding_provider=embedding_provider, seed=args.seed, C=args.C)
+        model = LRRewardModelV3(embedding_provider=embedding_provider, seed=args.seed, C=args.C, severity_zero_as_positive=args.severity_zero_as_positive)
     elif args.model == "lr_v4":
-        model = LRRewardModelV4(embedding_provider=embedding_provider, seed=args.seed, C=args.C)
+        model = LRRewardModelV4(embedding_provider=embedding_provider, seed=args.seed, C=args.C, severity_zero_as_positive=args.severity_zero_as_positive)
     elif args.model == "lr_v5":
-        model = LRRewardModelV5(embedding_provider=embedding_provider, seed=args.seed, C=args.C)
+        model = LRRewardModelV5(embedding_provider=embedding_provider, seed=args.seed, C=args.C, severity_zero_as_positive=args.severity_zero_as_positive)
     elif args.model == "lr_v6":
-        model = LRRewardModelV6(embedding_provider=embedding_provider, seed=args.seed, C=args.C)
+        model = LRRewardModelV6(embedding_provider=embedding_provider, seed=args.seed, C=args.C, severity_zero_as_positive=args.severity_zero_as_positive)
     elif args.model == "distilbert":
         model = DistilBertRewardModel(
             model_name=args.distilbert_model_name,
@@ -168,6 +169,11 @@ def main() -> None:
                 "n_test": len(test_examples),
                 **load_stats,  # n_rows_total, n_rows_skipped
                 **({"C": args.C} if args.model in ("lr_v1", "lr_v2", "lr_v3", "lr_v4", "lr_v5", "lr_v6") else {}),
+                **(
+                    {"severity_zero_as_positive": args.severity_zero_as_positive}
+                    if args.model in ("lr_v1", "lr_v3", "lr_v4", "lr_v5", "lr_v6")
+                    else {}
+                ),
                 **(
                     {
                         "v2_cosine_sim": args.v2_cosine_sim,

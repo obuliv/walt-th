@@ -57,7 +57,11 @@ def group_split(
 
 
 def all_candidates(example: Example) -> list[str]:
-    return [example.sql_good] + [b.sql for b in example.sql_bad]
+    # severity == 0 means a candidate executes to the same result as sql_good — not a
+    # real mistake, so it's excluded here (top1/mrr ranking) and in evaluate()'s
+    # pairwise loop below, consistent with LRRewardModel.fit()'s pairing rule. Every
+    # other severity (including None, from every pre-severity dataset) is unaffected.
+    return [example.sql_good] + [b.sql for b in example.sql_bad if b.severity != 0]
 
 
 OVERFITTING_METRIC_KEYS = ("top1_accuracy", "pairwise_accuracy", "mrr")
@@ -127,6 +131,8 @@ class BaseRewardModel(ABC):
 
             good_score = self.score(ex.question, ex.sql_good, ex.sql_context_clean)
             for bad in ex.sql_bad:
+                if bad.severity == 0:
+                    continue  # tied with sql_good — no signal, excluded for consistency with fit()
                 bad_score = self.score(ex.question, bad.sql, ex.sql_context_clean)
                 pair_total += 1
                 correct = int(good_score > bad_score)

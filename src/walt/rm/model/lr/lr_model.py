@@ -22,7 +22,7 @@ import numpy as np
 from sklearn.linear_model import LogisticRegression
 
 from walt.rm.data.base import Example
-from walt.rm.model.base import BaseRewardModel, all_candidates
+from walt.rm.model.base import BaseRewardModel
 from walt.rm.model.embeddings import EmbeddingProvider, build_provider_from_config
 
 
@@ -37,6 +37,7 @@ class LRRewardModel(BaseRewardModel):
         C: float = 1.0,
         penalty: str = "l2",
         l1_ratio: Optional[float] = None,
+        severity_zero_as_positive: bool = False,
     ):
         if penalty not in SOLVER_BY_PENALTY:
             raise ValueError(f"penalty must be one of {sorted(SOLVER_BY_PENALTY)}, got {penalty!r}")
@@ -47,6 +48,15 @@ class LRRewardModel(BaseRewardModel):
         self.C = C  # inverse regularization strength (sklearn convention: smaller = more regularization)
         self.penalty = penalty
         self.l1_ratio = l1_ratio
+        # Ablation flag (default off, so every existing caller/dataset is unaffected):
+        # when True, fit() additionally treats each severity==0 sql_bad candidate ("same
+        # result as sql_good") as a second positive anchor — paired against every real
+        # bad the same way sql_good itself is — instead of excluding it from every pair.
+        # No-op on datasets that never populate severity (severity is always None there,
+        # never 0). See CLAUDE.md/enhance_severity_dataset.py for why severity==0 is a
+        # less-trustworthy label than sql_good itself, which is what makes this an
+        # ablation to compare rather than an obvious default.
+        self.severity_zero_as_positive = severity_zero_as_positive
         self.coef_: Optional[np.ndarray] = None  # shape (dim + 1,)
         self._question_cache: dict[str, np.ndarray] = {}
         self._sql_cache: dict[str, np.ndarray] = {}
@@ -68,9 +78,14 @@ class LRRewardModel(BaseRewardModel):
         """Pre-embeds every unique question and unique SQL string (good + bad) across
         `examples` that isn't already cached, in one batched call each. Callers should
         warm the cache for both train and eval examples up front so score()/evaluate()
-        never fall back to slow one-string-at-a-time embedding calls."""
+        never fall back to slow one-string-at-a-time embedding calls.
+
+        Deliberately embeds every sql_bad candidate directly (not via all_candidates(),
+        which excludes severity==0 — correct for evaluate()'s ranking, but fit() with
+        severity_zero_as_positive=True needs those embeddings too). A cached-but-unused
+        embedding is free; a missing one is a hard KeyError in _phi()."""
         questions = [ex.question for ex in examples]
-        sqls = [sql for ex in examples for sql in all_candidates(ex)]
+        sqls = [ex.sql_good for ex in examples] + [b.sql for ex in examples for b in ex.sql_bad]
         self._embed_unique(questions, self._question_cache)
         self._embed_unique(sqls, self._sql_cache)
 
@@ -91,11 +106,46 @@ class LRRewardModel(BaseRewardModel):
         rng = random.Random(self.seed)
         X_rows, y_rows = [], []
         for ex in train_examples:
-            for bad in ex.sql_bad:
+            # Effective-rank rule (see CLAUDE.md / lr_model.py fit() docstring):
+            # sql_good is always strictly better than every bad candidate. severity is
+            # None for every pre-severity dataset — those bads are only ever paired
+            # against sql_good, never against each other, so an all-None example
+            # produces the exact same pairs, in the exact same order, consuming rng
+            # identically, as before this change (a deliberate, tested backward-
+            # compatibility guarantee). severity == 0 means "executes to the same
+            # result as sql_good" — excluded from every pair, good-vs-bad or
+            # bad-vs-bad, since a tied pair has no learnable signal. severity in 1..5
+            # bads are additionally paired against each other whenever their severity
+            # differs (equal-severity pairs are skipped for the same no-signal reason).
+            none_bads = [b for b in ex.sql_bad if b.severity is None]
+            ranked_bads = [b for b in ex.sql_bad if b.severity is not None and b.severity > 0]
+            # severity_zero_as_positive (default off — see __init__): when on, every
+            # severity==0 candidate additionally stands in for sql_good as a positive
+            # anchor, paired against every none/ranked bad the same way sql_good is.
+            # Zero-severity candidates are never paired against sql_good or each other
+            # (both sides tied at the same correctness rank — no signal either way).
+            positive_anchors = [ex.sql_good]
+            if self.severity_zero_as_positive:
+                positive_anchors += [b.sql for b in ex.sql_bad if b.severity == 0]
+
+            pairs: list[tuple[str, str]] = []  # (better_sql, worse_sql)
+            for anchor in positive_anchors:
+                for b in none_bads:
+                    pairs.append((anchor, b.sql))
+                for b in ranked_bads:
+                    pairs.append((anchor, b.sql))
+            for i, b1 in enumerate(ranked_bads):
+                for b2 in ranked_bads[i + 1 :]:
+                    if b1.severity == b2.severity:
+                        continue
+                    better, worse = (b1, b2) if b1.severity < b2.severity else (b2, b1)
+                    pairs.append((better.sql, worse.sql))
+
+            for better_sql, worse_sql in pairs:
                 if rng.random() < 0.5:
-                    a_sql, b_sql, label = ex.sql_good, bad.sql, 1
+                    a_sql, b_sql, label = better_sql, worse_sql, 1
                 else:
-                    a_sql, b_sql, label = bad.sql, ex.sql_good, 0
+                    a_sql, b_sql, label = worse_sql, better_sql, 0
                 phi_a = self._phi(ex.question, a_sql, ex.sql_context_clean)
                 phi_b = self._phi(ex.question, b_sql, ex.sql_context_clean)
                 X_rows.append(phi_a - phi_b)
@@ -136,6 +186,7 @@ class LRRewardModel(BaseRewardModel):
             "lr_n_iter": n_iter,
             "lr_converged": n_iter < max_iter,
             "lr_n_zero_coefs": n_zero_coefs,  # implicit feature selection under L1/elasticnet; always 0 under L2
+            "severity_zero_as_positive": self.severity_zero_as_positive,
             "embed_seconds": round(embed_seconds, 3),
             "fit_seconds": round(fit_seconds, 3),
         }
@@ -155,6 +206,7 @@ class LRRewardModel(BaseRewardModel):
             "C": self.C,
             "penalty": self.penalty,
             "l1_ratio": self.l1_ratio,
+            "severity_zero_as_positive": self.severity_zero_as_positive,
             "embedding_config": self.embedding_provider.config,
         }
         joblib.dump(payload, path)
@@ -169,6 +221,7 @@ class LRRewardModel(BaseRewardModel):
             C=payload.get("C", 1.0),
             penalty=payload.get("penalty", "l2"),
             l1_ratio=payload.get("l1_ratio"),
+            severity_zero_as_positive=payload.get("severity_zero_as_positive", False),
         )
         model.coef_ = payload["coef"]
         return model

@@ -46,6 +46,7 @@ def main() -> None:
     parser.add_argument("--C", type=float, default=300.0, help="[lr_v1/lr_v2/.../lr_v6 only] LogisticRegression inverse regularization strength — 300 is CV-tuned for lr_v6 on gretel-only data (sklearn's own default is 1.0); other models/datasets were tuned separately, see CLAUDE.md")
     parser.add_argument("--penalty", choices=sorted(SOLVER_BY_PENALTY), default="l2", help="[lr_v1/lr_v2/lr_v3/lr_v3_scaled only] LogisticRegression penalty type")
     parser.add_argument("--l1-ratio", type=float, default=None, help="[penalty=elasticnet only] elastic-net mixing parameter in [0,1] (0=l2, 1=l1)")
+    parser.add_argument("--severity-zero-as-positive", action="store_true", help="[lr_v1/lr_v3/lr_v4/lr_v5/lr_v6 only] treat severity==0 sql_bad candidates (from enhance_severity_dataset.py) as extra positive anchors paired against every real bad, instead of excluding them from every pair. No-op on datasets without severity — compare against the default (off) to A/B this.")
     parser.add_argument("--v2-cosine-sim", dest="v2_cosine_sim", action=argparse.BooleanOptionalAction, default=True, help="[lr_v2 only]")
     parser.add_argument("--v2-dot-product", dest="v2_dot_product", action=argparse.BooleanOptionalAction, default=True, help="[lr_v2 only]")
     parser.add_argument("--v2-standardize-dot", dest="v2_standardize_dot", action=argparse.BooleanOptionalAction, default=True, help="[lr_v2 only]")
@@ -78,7 +79,10 @@ def main() -> None:
 
     def model_factory():
         if args.model == "lr_v1":
-            return LRRewardModel(embedding_provider=embedding_provider, seed=args.seed, C=args.C, penalty=args.penalty, l1_ratio=args.l1_ratio)
+            return LRRewardModel(
+                embedding_provider=embedding_provider, seed=args.seed, C=args.C, penalty=args.penalty,
+                l1_ratio=args.l1_ratio, severity_zero_as_positive=args.severity_zero_as_positive,
+            )
         if args.model == "lr_v2":
             return LRRewardModelV2(
                 embedding_provider=embedding_provider,
@@ -91,13 +95,25 @@ def main() -> None:
                 standardize_dot_product=args.v2_standardize_dot,
             )
         if args.model == "lr_v3":
-            return LRRewardModelV3(embedding_provider=embedding_provider, seed=args.seed, C=args.C, penalty=args.penalty, l1_ratio=args.l1_ratio)
+            return LRRewardModelV3(
+                embedding_provider=embedding_provider, seed=args.seed, C=args.C, penalty=args.penalty,
+                l1_ratio=args.l1_ratio, severity_zero_as_positive=args.severity_zero_as_positive,
+            )
         if args.model == "lr_v4":
-            return LRRewardModelV4(embedding_provider=embedding_provider, seed=args.seed, C=args.C, penalty=args.penalty, l1_ratio=args.l1_ratio)
+            return LRRewardModelV4(
+                embedding_provider=embedding_provider, seed=args.seed, C=args.C, penalty=args.penalty,
+                l1_ratio=args.l1_ratio, severity_zero_as_positive=args.severity_zero_as_positive,
+            )
         if args.model == "lr_v5":
-            return LRRewardModelV5(embedding_provider=embedding_provider, seed=args.seed, C=args.C, penalty=args.penalty, l1_ratio=args.l1_ratio)
+            return LRRewardModelV5(
+                embedding_provider=embedding_provider, seed=args.seed, C=args.C, penalty=args.penalty,
+                l1_ratio=args.l1_ratio, severity_zero_as_positive=args.severity_zero_as_positive,
+            )
         if args.model == "lr_v6":
-            return LRRewardModelV6(embedding_provider=embedding_provider, seed=args.seed, C=args.C, penalty=args.penalty, l1_ratio=args.l1_ratio)
+            return LRRewardModelV6(
+                embedding_provider=embedding_provider, seed=args.seed, C=args.C, penalty=args.penalty,
+                l1_ratio=args.l1_ratio, severity_zero_as_positive=args.severity_zero_as_positive,
+            )
         if args.model == "lr_v3_scaled":
             return LRRewardModelV3Scaled(
                 embedding_provider=embedding_provider,
@@ -138,6 +154,11 @@ def main() -> None:
                 "C": args.C,
                 "penalty": args.penalty,
                 "l1_ratio": args.l1_ratio,
+                **(
+                    {"severity_zero_as_positive": args.severity_zero_as_positive}
+                    if args.model in ("lr_v1", "lr_v3", "lr_v4", "lr_v5", "lr_v6")
+                    else {}
+                ),
                 **(
                     {"v2_cosine_sim": args.v2_cosine_sim, "v2_dot_product": args.v2_dot_product, "v2_standardize_dot": args.v2_standardize_dot}
                     if args.model == "lr_v2"
