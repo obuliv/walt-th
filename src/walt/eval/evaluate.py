@@ -25,7 +25,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from walt.agent.sql_agent import SqlAgent, build_llm
 from walt.rm.data.base import Example
@@ -43,7 +43,12 @@ from walt.rm.model.tracking import log_run
 # reranking at all" as a baseline against the real RM classes.
 RM_CLASS_CHOICES = ["lr_v3", "lr_v6", "distilbert", "constant"]
 RM_CLASS_BY_NAME = {"lr_v3": LRRewardModelV3, "lr_v6": LRRewardModelV6}
-from walt.utils.sql_exec import ExecutionResult, execute_with_context
+from walt.utils.sql_exec import (
+    ExecutionResult,
+    capture_db_state,
+    execute_with_context,
+    resolve_context_statements,
+)
 
 
 def _row_sort_key(row: tuple) -> tuple:
@@ -55,13 +60,39 @@ def _row_sort_key(row: tuple) -> tuple:
     return tuple((v is None, v) if v is not None else (True, "") for v in row)
 
 
-def _rows_match(a: ExecutionResult, b: ExecutionResult) -> bool:
+def _rows_match(a: ExecutionResult, b: ExecutionResult) -> bool | None:
     # Deliberately ignores a.columns/b.columns: SQLite auto-labels a result column from
     # the expression text itself when there's no explicit alias (e.g. `AVG(Age)` vs
     # `AVG(T1.Age)` for a table-qualified rewrite of the same column) — column *names*
     # are cosmetic, not part of whether the agent got the right answer. Only the actual
     # row values (and their count/order within a row) are compared.
-    return sorted(a.rows or (), key=_row_sort_key) == sorted(b.rows or (), key=_row_sort_key)
+    #
+    # A failed execution (rows=None, success=False) is never a match, regardless of what
+    # the other side looks like — it must NOT be treated as "returned zero rows", or any
+    # candidate that crashes gets silently credited as correct on every question whose
+    # real answer happens to be empty. Returns None (rather than True/False) when both
+    # sides succeeded but neither has a row set at all — non-SELECT statements
+    # (UPDATE/DELETE/INSERT/DDL) always report rows=None on success, so "both None" isn't
+    # evidence of a match either; the caller must fall back to a different comparison
+    # (see _effect_match) for that case instead of defaulting to "equal".
+    if not a.success or not b.success:
+        return False
+    if a.rows is None and b.rows is None:
+        return None
+    if a.rows is None or b.rows is None:
+        return False
+    return sorted(a.rows, key=_row_sort_key) == sorted(b.rows, key=_row_sort_key)
+
+
+def _effect_match(context_statements: Sequence[str], sql_a: str, sql_b: str) -> bool:
+    """Fallback for _rows_match's None case (both statements are non-SELECT, so neither
+    has a row set to compare): re-runs context_statements + each statement from scratch
+    via capture_db_state and compares the full resulting database state (every table's
+    rows) instead. Each side gets its own fresh in-memory DB, so sql_a's effect can never
+    leak into sql_b's run."""
+    ok_a, state_a = capture_db_state(context_statements, sql_a)
+    ok_b, state_b = capture_db_state(context_statements, sql_b)
+    return ok_a and ok_b and state_a == state_b
 
 
 def _rate(count: int, total: int) -> dict[str, Any]:
@@ -128,8 +159,25 @@ def evaluate_agent(val_examples: list[Example], agent: SqlAgent) -> dict[str, An
 
         if ex.sql_context_valid:
             reference = execute_with_context(ex.sql_context, ex.sql_context_path, ex.sql_good)
-            rm_correct = _rows_match(rm_execution, reference)
-            base_correct = _rows_match(base_execution, reference)
+
+            # Lazily resolved: only needed when _rows_match can't decide from row sets
+            # alone (both sides non-SELECT) — never touched for a purely-SELECT dataset
+            # like Spider, so this costs nothing there.
+            _resolved_context_cache: list[tuple[str, ...] | None] = [None]
+
+            def _resolved_context() -> tuple[str, ...]:
+                if _resolved_context_cache[0] is None:
+                    _resolved_context_cache[0] = resolve_context_statements(ex.sql_context, ex.sql_context_path)
+                return _resolved_context_cache[0]
+
+            def _qa_match(execution: ExecutionResult, sql: str) -> bool:
+                match = _rows_match(execution, reference)
+                if match is not None:
+                    return match
+                return _effect_match(_resolved_context(), sql, ex.sql_good)
+
+            rm_correct = _qa_match(rm_execution, result.best_sql)
+            base_correct = _qa_match(base_execution, baseline_sql)
             rm_qa += int(rm_correct)
             base_qa += int(base_correct)
 
@@ -141,7 +189,7 @@ def evaluate_agent(val_examples: list[Example], agent: SqlAgent) -> dict[str, An
                 execution = executions_by_sql.setdefault(
                     sql, execute_with_context(ex.sql_context, ex.sql_context_path, sql)
                 )
-                n_correct += int(_rows_match(execution, reference))
+                n_correct += int(_qa_match(execution, sql))
 
             n_candidates = len(result.raw_candidates)
             if n_correct == n_candidates:

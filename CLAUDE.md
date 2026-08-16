@@ -849,3 +849,76 @@ similarity) may simply generalize better here — not re-examined further. Artif
 `data/output/rm_model_synth_lr_v6_C300.joblib`,
 `data/output/rm_metrics_synth_lr_v6_C300.json`, `data/output/eval_synth_lr_v6_C300.json`,
 runs logged to `data/output/runs/`/`data/output/eval_runs/` as `synth_lr_v6_C300*`.
+
+**Synth ablations: the learned RM adds ~nothing on top of a hard schema-validity filter
+— confirmed across `lr_v6`, distilbert, and a cross-domain model (2026-08-16).** Four
+follow-up experiments, all against the same 300-row synth val set / cached `llama3.2`
+candidates as the baseline above (so directly comparable), each written to its own new
+`data/output/synth_*/` folder — nothing under `data/output/synth/` or the shared
+`data/output/runs/`/`eval_runs/` was touched:
+
+- **`add_llama_negatives.py` on synth's `trainval` split** (`data/output/synth_llama/`)
+  — this script predates `sql_context_path` and read `record.get("sql_context") or []`
+  directly, which is always empty for synth rows; fixed by adding
+  `sql_exec.resolve_context_statements(sql_context, sql_context_path)` (returns
+  `sql_context` as-is if non-empty, else loads the full context from the path — the same
+  resolution `execute_with_context` does, minus the caching, for callers like this one
+  that need the raw statement list rather than to execute one query) and using it in
+  `llama_negatives_for_row`. 2,000 `trainval` rows in ≈13s (helped by the LLM cache);
+  1,423 rows (71.2%) got at least one new `reason="llama"` negative, 2,875 total. `val`
+  rows confirmed byte-identical before/after (verified directly, not assumed). Training
+  `lr_v6`/`C=300` on this: CV top1 dropped 0.9985→0.9840, val top1 1.0000→0.9733 (two of
+  the four *original* categories got measurably worse: `missing_filters` 100%→95.89%,
+  `wrong_aggregation` 100%→98.82%) — and at the agent level, QA accuracy dropped
+  166/300→159/300 and mixed-bucket achieved 118/156→111/156. **The opposite of what this
+  technique fixed for gretel** (see the RM-transfer finding above) — plausible cause: the
+  synth RM was already transferring cleanly, so there was no gap for llama negatives to
+  close, and `C=300` was never re-tuned for the harder, more diverse signal this adds.
+
+- **Cross-domain check: evaluating synth's val set with `rm_model_lr_v6_C300_gretel_llama.joblib`**
+  (a model trained on an entirely different dataset — gretel+llama, no Spider schemas
+  ever seen) (`data/output/synth_cross_eval/`) — SQL pass rate is *identical* to the
+  synth-trained model (286/300, 95.3%) and QA accuracy is close (163/300, 54.3% vs the
+  synth-trained model's 166/300, 55.3% — a 3-row difference on n=300). The RM's own
+  pairwise discrimination accuracy on synth's `sql_good`/`sql_bad` pairs is where the real
+  gap is (87.0% cross-domain vs 100% synth-trained) — that gap just doesn't propagate
+  through to agent-level behavior. **Of the ~9pp total QA-accuracy lift from reranking,
+  ~8pp (≈89%) is already captured by a model that never saw this dataset's training
+  data** — most of what looks like "the RM helping" here isn't specific to synth's own
+  training data at all.
+
+- **The actual driver, isolated directly**: `evaluate.py` gained `--rm-class constant`
+  (`rm/model/constant_model.py` — scores every candidate `0.0`, so `rank()`'s stable sort
+  just preserves the LLM's original generation order) and `--schema-filter`
+  (`rm/model/schema_filter.py` — wraps any model, adding a large penalty to any candidate
+  failing `is_schema_valid` before delegating to the inner model's own score, so a
+  schema-valid candidate always outranks an invalid one regardless of what the inner
+  model prefers among survivors). `constant` with no filter is byte-for-byte identical to
+  no reranking at all (216/300 SQL pass either way — confirms the wiring: a tied score
+  really does degrade to "first candidate, LLM's own order"). `constant` **+**
+  `--schema-filter` — zero learned signal, zero training data, just "reject
+  schema-invalid candidates, keep the LLM's order among the rest" — hits 286/300 (95.3%)
+  SQL pass and **168/300 (56.0%) QA accuracy, the best QA accuracy of every configuration
+  tested in this file, beating the synth-trained `lr_v6` model itself** (166/300, 55.3%).
+  SQL pass rate is 286/300 across *every* schema-filtered configuration regardless of
+  which model sits underneath — 100% of that lift is the filter, 0% is anything learned.
+
+- **Distilbert, synth+llama, with and without the filter** (`data/output/synth_llama/`,
+  `rm_model_distilbert_synth_llama.pt`) — training itself lands in the same "synth is
+  easy" pattern as `lr_v6`: top1/pairwise/mrr 0.9300/0.9812/0.9627, vs the reference
+  gretel+llama distilbert run's 0.5526/0.8830/0.7420 (same architecture, same recipe,
+  wildly different difficulty — confirms this isn't `lr_v6`-specific). At the agent
+  level, **without** `--schema-filter` it's actively harmful — 211/300 (70.3%) SQL pass
+  and 128/300 (42.7%) QA accuracy, *both below* the no-rerank baseline (216/300 / 46.3%),
+  and its mixed-bucket achieved rate (51.3%) sits at/below random chance (51.8%) —
+  reproducing on synth exactly the gretel-side finding that motivated building
+  `schema_filter.py` in the first place (a model that sometimes actively prefers a
+  schema-invalid candidate). **With** `--schema-filter` it converges to numbers
+  essentially identical to every other schema-filtered configuration — 286/300 (95.3%) /
+  166/300 (55.3%) / 118/156 (75.6%), matching `constant`+filter and the synth-trained
+  `lr_v6` almost exactly.
+
+**Net takeaway for this dataset**: the real baseline to beat isn't "no reranking"
+(72.0%/46.3%) — it's "schema-filter, no learned model at all" (95.3%/56.0%), and nothing
+trained here (three `lr_v6` variants, one distilbert variant) actually clears that bar.
+`is_schema_valid` is carrying essentially the entire agent-level result on this val set.
