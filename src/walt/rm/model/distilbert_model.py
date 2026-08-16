@@ -9,10 +9,13 @@ native API only supports 2-segment (text, text_pair) inputs —
     [CLS] sql_context [SEP] question [SEP] sql [SEP]
 (DistilBERT has no token_type_ids parameter at all — no segment embeddings — so the
 3-segment structure is communicated purely via [SEP] positions + attention_mask.)
-sql_context is joined with "\n" (matching the convention already used by
-sql_agent.py / lr_model_context.py) and is the only segment ever truncated, from the
-end, to fit max_length — question and sql are never truncated except as a last-resort
-if they alone exceed the budget (should be rare; see distilbert_preflight.py).
+sql_context here is the clean, data-free schema (Example.sql_context_clean — CREATE
+TABLE/etc only, INSERT rows stripped, see walt.utils.sql_exec.clean_context()), joined
+with "\n" (matching the convention already used by sql_agent.py / lr_model_context.py)
+— not the full sql_context with sample data, same schema-only view the LLM/other RM
+variants see post clean-context. It's the only segment ever truncated, from the end, to
+fit max_length — question and sql are never truncated except as a last-resort if they
+alone exceed the budget (should be rare; see distilbert_preflight.py).
 
 Training objective mirrors LRRewardModel.fit's exact anti-positional-bias pattern: one
 random.Random(seed), consumed sequentially per sql_bad candidate, decides which side
@@ -73,7 +76,7 @@ def build_pairs(examples: list[Example], seed: int) -> list[_Pair]:
                 sql_a, sql_b, label = ex.sql_good, bad.sql, 1.0
             else:
                 sql_a, sql_b, label = bad.sql, ex.sql_good, 0.0
-            pairs.append(_Pair(ex.question, ex.sql_context, sql_a, sql_b, label, bad.reason))
+            pairs.append(_Pair(ex.question, ex.sql_context_clean, sql_a, sql_b, label, bad.reason))
     return pairs
 
 

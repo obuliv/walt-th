@@ -42,7 +42,7 @@ def token_length_report(examples, tokenizer, max_length: int) -> None:
     total_lengths: list[int] = []
     context_lengths: list[int] = []
     for ex in examples:
-        context_text = "\n".join(ex.sql_context)
+        context_text = "\n".join(ex.sql_context_clean)
         context_ids = tokenizer.encode(context_text, add_special_tokens=False)
         question_ids = tokenizer.encode(ex.question, add_special_tokens=False)
         context_lengths.append(len(context_ids))

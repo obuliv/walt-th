@@ -30,13 +30,18 @@ from typing import Any
 from walt.agent.sql_agent import SqlAgent, build_llm
 from walt.rm.data.base import Example
 from walt.rm.model.base import load_examples
+from walt.rm.model.constant_model import ConstantRewardModel
 from walt.rm.model.distilbert_model import DistilBertRewardModel
 from walt.rm.model.embeddings import SentenceTransformerEmbedding
 from walt.rm.model.lr.lr_model_v3 import LRRewardModelV3
 from walt.rm.model.lr.lr_model_v6 import LRRewardModelV6
+from walt.rm.model.schema_filter import SchemaFilteredRewardModel
 from walt.rm.model.tracking import log_run
 
-RM_CLASS_CHOICES = ["lr_v3", "lr_v6", "distilbert"]
+# "constant" needs no --rm-model file (ConstantRewardModel has no trainable state) —
+# combine with --schema-filter to test "first schema-valid LLM candidate, no learned
+# reranking at all" as a baseline against the real RM classes.
+RM_CLASS_CHOICES = ["lr_v3", "lr_v6", "distilbert", "constant"]
 RM_CLASS_BY_NAME = {"lr_v3": LRRewardModelV3, "lr_v6": LRRewardModelV6}
 from walt.utils.sql_exec import ExecutionResult, execute_with_context
 
@@ -200,6 +205,7 @@ def main() -> None:
     parser.add_argument("--run-name", default=None, help="Label for this run in the run log (default: derived from --rm-model and the LLM model)")
     parser.add_argument("--runs-dir", type=Path, default=Path("data/output/eval_runs"), help="Directory where agent-eval run records are logged for later comparison (separate from RM training's data/output/runs/ — different metric shape)")
     parser.add_argument("--no-log-run", action="store_true", help="Skip writing a run record (e.g. for throwaway/debug runs)")
+    parser.add_argument("--schema-filter", action="store_true", help="Wrap --rm-model in SchemaFilteredRewardModel — a hard is_schema_valid pre-filter applied before the RM's own scoring (see schema_filter.py). No-op for lr_v6 (already learns this internally); meant for models with no equivalent feature, e.g. distilbert")
     args = parser.parse_args()
 
     examples = load_examples(args.input)
@@ -208,11 +214,15 @@ def main() -> None:
         val_examples = val_examples[: args.limit]
     print(f"Evaluating on {len(val_examples)} val examples")
 
-    if args.rm_class == "distilbert":
+    if args.rm_class == "constant":
+        rm = ConstantRewardModel()
+    elif args.rm_class == "distilbert":
         rm = DistilBertRewardModel.load(args.rm_model)
     else:
         embedding_provider = SentenceTransformerEmbedding()
         rm = RM_CLASS_BY_NAME[args.rm_class].load(args.rm_model, embedding_provider=embedding_provider)
+    if args.schema_filter:
+        rm = SchemaFilteredRewardModel(rm)
     rm.warm_cache(val_examples)
 
     rm_metrics = rm.evaluate(val_examples)
@@ -275,6 +285,7 @@ def main() -> None:
                 "input": str(args.input),
                 "rm_model": str(args.rm_model),
                 "rm_class": args.rm_class,
+                "schema_filter": args.schema_filter,
                 "llm_backend": args.llm_backend,
                 "llm_model": llm_model,
                 "n_candidates": args.n_candidates,
