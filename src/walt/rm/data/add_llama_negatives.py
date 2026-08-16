@@ -42,7 +42,7 @@ from walt.agent.llm.caching_llm import CachingLLM
 from walt.agent.llm.ollama_llm import OllamaLLM
 from walt.rm.data.fix_sql_bad import _comparison_signal
 from walt.rm.data.gen_training_data import load_records, write_jsonl
-from walt.utils.sql_exec import clean_context, run_sql
+from walt.utils.sql_exec import clean_context, resolve_context_statements, run_sql
 
 REASON = "llama"
 
@@ -53,7 +53,7 @@ def llama_negatives_for_row(llm: BaseLLM, record: dict[str, Any], n_candidates: 
     byte-identical duplicate or matches sql_good's result."""
     if not record.get("sql_context_valid"):
         return []
-    context = record.get("sql_context") or []
+    context = resolve_context_statements(record.get("sql_context") or (), record.get("sql_context_path"))
     good = run_sql(context, record["sql_good"])
     if not good.success:
         return []

@@ -128,6 +128,20 @@ def load_context_from_sqlite(sqlite_path: Path, timeout: float = 5.0) -> tuple[s
         conn.close()
 
 
+def resolve_context_statements(sql_context: Sequence[str], sql_context_path: str | None) -> tuple[str, ...]:
+    """Returns sql_context as-is (non-empty) — otherwise loads the full context from
+    sql_context_path via load_context_from_sqlite. Unlike execute_with_context (which
+    executes one query, with caching), this returns the raw statement tuple itself, for
+    callers that need the list directly rather than through run_sql — e.g.
+    add_llama_negatives.py's clean_context(context)/_comparison_signal(context, ...)
+    calls, which predate sql_context_path and expect a plain Sequence[str]."""
+    if sql_context:
+        return tuple(sql_context)
+    if not sql_context_path:
+        return ()
+    return load_context_from_sqlite(_resolve_sqlite_path(sql_context_path))
+
+
 _MUTATING_TYPES = (exp.Insert, exp.Update, exp.Delete, exp.Create, exp.Drop, exp.Alter)
 
 
