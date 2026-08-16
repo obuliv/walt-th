@@ -38,7 +38,7 @@ from walt.rm.model.tracking import log_run
 
 RM_CLASS_CHOICES = ["lr_v3", "lr_v6", "distilbert"]
 RM_CLASS_BY_NAME = {"lr_v3": LRRewardModelV3, "lr_v6": LRRewardModelV6}
-from walt.utils.sql_exec import ExecutionResult, run_sql
+from walt.utils.sql_exec import ExecutionResult, execute_with_context
 
 
 def _row_sort_key(row: tuple) -> tuple:
@@ -64,8 +64,15 @@ def _rate(count: int, total: int) -> dict[str, Any]:
 
 
 def evaluate_agent(val_examples: list[Example], agent: SqlAgent) -> dict[str, Any]:
-    executable = [ex for ex in val_examples if ex.sql_context]
+    executable = [ex for ex in val_examples if ex.sql_context or ex.sql_context_path]
     qa_examples = [ex for ex in executable if ex.sql_context_valid]
+
+    # Rows that carry sql_context_path (see walt.utils.sql_exec.execute_with_context)
+    # reuse a cached in-memory connection across calls that share the same path — sorting
+    # groups those consecutive so the cache stays warm instead of rebuilding per row. Rows
+    # without a path (gretel/spider/dbasql — full sql_context embedded directly) sort
+    # together too, but gain nothing from it since they were never cached to begin with.
+    executable = sorted(executable, key=lambda ex: ex.sql_context_path or "")
 
     rm_pass = base_pass = 0
     rm_qa = base_qa = 0
@@ -85,7 +92,12 @@ def evaluate_agent(val_examples: list[Example], agent: SqlAgent) -> dict[str, An
     print(f"Running agent over {len(executable)} executable val rows...")
     for i, ex in enumerate(executable, 1):
         try:
-            result = agent.run(ex.question, list(ex.sql_context))
+            result = agent.run(
+                ex.question,
+                list(ex.sql_context),
+                sql_context_clean=list(ex.sql_context_clean),
+                sql_context_path=ex.sql_context_path,
+            )
         except RuntimeError as exc:
             # The LLM produced zero usable candidates for this row (can happen with a
             # small n_candidates against a reasoning model that burns its token budget
@@ -101,14 +113,16 @@ def evaluate_agent(val_examples: list[Example], agent: SqlAgent) -> dict[str, An
         # this row instead of calling the LLM again.
         baseline_sql = result.raw_candidates[0]
         base_execution = (
-            rm_execution if baseline_sql == result.best_sql else run_sql(ex.sql_context, baseline_sql)
+            rm_execution
+            if baseline_sql == result.best_sql
+            else execute_with_context(ex.sql_context, ex.sql_context_path, baseline_sql)
         )
 
         rm_pass += int(rm_execution.success)
         base_pass += int(base_execution.success)
 
         if ex.sql_context_valid:
-            reference = run_sql(ex.sql_context, ex.sql_good)
+            reference = execute_with_context(ex.sql_context, ex.sql_context_path, ex.sql_good)
             rm_correct = _rows_match(rm_execution, reference)
             base_correct = _rows_match(base_execution, reference)
             rm_qa += int(rm_correct)
@@ -119,7 +133,9 @@ def evaluate_agent(val_examples: list[Example], agent: SqlAgent) -> dict[str, An
             executions_by_sql = {result.best_sql: rm_execution, baseline_sql: base_execution}
             n_correct = 0
             for sql in result.raw_candidates:
-                execution = executions_by_sql.setdefault(sql, run_sql(ex.sql_context, sql))
+                execution = executions_by_sql.setdefault(
+                    sql, execute_with_context(ex.sql_context, ex.sql_context_path, sql)
+                )
                 n_correct += int(_rows_match(execution, reference))
 
             n_candidates = len(result.raw_candidates)

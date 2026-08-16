@@ -21,7 +21,7 @@ from walt.agent.llm.ollama_llm import OllamaLLM
 from walt.rm.model.base import BaseRewardModel, ScoredCandidate
 from walt.rm.model.embeddings import SentenceTransformerEmbedding
 from walt.rm.model.lr.lr_model_v6 import LRRewardModelV6
-from walt.utils.sql_exec import ExecutionResult, clean_context, run_sql
+from walt.utils.sql_exec import ExecutionResult, clean_context, execute_with_context
 
 
 @dataclass(frozen=True)
@@ -82,18 +82,31 @@ class SqlAgent:
         # from everything else in the pipeline (RM scoring, SQL execution).
         self.strip_llm_context = strip_llm_context
 
-    def run(self, question: str, schema_context: list[str]) -> AgentResult:
+    def run(
+        self,
+        question: str,
+        schema_context: list[str],
+        sql_context_clean: list[str] | None = None,
+        sql_context_path: str | None = None,
+    ) -> AgentResult:
         # LLM/RM see only the schema (CREATE TABLE etc, no INSERT rows) — sample data is
         # noise for "does this candidate SQL fit the schema", and is only needed below
-        # for actually executing the chosen candidate.
-        clean_schema = clean_context(schema_context)
+        # for actually executing the chosen candidate. sql_context_clean lets a caller
+        # pass the already-computed DDL-only schema directly (needed when schema_context
+        # itself is empty by design — see sql_context_path below — so there'd be nothing
+        # for clean_context() to derive it from); defaults to deriving it the old way.
+        clean_schema = sql_context_clean if sql_context_clean is not None else clean_context(schema_context)
         llm_context = "" if self.strip_llm_context else "\n".join(clean_schema)
         candidates = self.llm.generate_candidates(question, llm_context, self.n_candidates)
         if not candidates:
             raise RuntimeError(f"LLM produced no candidate SQL for question: {question!r}")
         scored = self.rm.rank(question, candidates, sql_context=clean_schema)
         best = scored[0]
-        execution = run_sql(schema_context, best.sql)
+        # sql_context_path lets execution fall back to a real .sqlite file (relative to
+        # $DATA_PATH, cached across calls) when schema_context itself is empty — see
+        # walt.utils.sql_exec.execute_with_context. When schema_context is non-empty this
+        # is identical to the old run_sql(schema_context, best.sql) call.
+        execution = execute_with_context(schema_context, sql_context_path, best.sql)
         return AgentResult(
             question=question,
             raw_candidates=candidates,
@@ -125,6 +138,8 @@ def run_agent(
     question: str,
     schema_context: list[str],
     *,
+    sql_context_clean: list[str] | None = None,
+    sql_context_path: str | None = None,
     rm_model_path: str | Path = "data/output/rm_model.joblib",
     ollama_model: str = "llama3.2",
     llm_backend: str = "ollama",
@@ -136,7 +151,7 @@ def run_agent(
     rm = LRRewardModelV6.load(rm_model_path, embedding_provider=embedding_provider)
     llm = build_llm(ollama_model, llm_cache_path, backend=llm_backend)
     agent = SqlAgent(llm=llm, rm=rm, n_candidates=n_candidates, strip_llm_context=strip_llm_context)
-    return agent.run(question, schema_context)
+    return agent.run(question, schema_context, sql_context_clean=sql_context_clean, sql_context_path=sql_context_path)
 
 
 def main() -> None:
@@ -153,12 +168,16 @@ def main() -> None:
     parser.add_argument("--strip-context", action="store_true", help="Don't show the LLM schema_context when generating candidates (still used for execution) — tests unconditioned generation")
     args = parser.parse_args()
 
+    sql_context_clean = None
+    sql_context_path = None
     if args.input:
         with args.input.open(encoding="utf-8") as f:
             rows = [json.loads(line) for line in f if line.strip()]
         record = rows[args.index]
         question = record["question"]
         schema_context = record.get("sql_context", [])
+        sql_context_clean = record.get("sql_context_clean")
+        sql_context_path = record.get("sql_context_path")
     elif args.question:
         question = args.question
         schema_context = args.schema_file.read_text().splitlines() if args.schema_file else []
@@ -169,6 +188,8 @@ def main() -> None:
     result = run_agent(
         question,
         schema_context,
+        sql_context_clean=sql_context_clean,
+        sql_context_path=sql_context_path,
         rm_model_path=args.rm_model,
         ollama_model=args.ollama_model,
         n_candidates=args.n_candidates,

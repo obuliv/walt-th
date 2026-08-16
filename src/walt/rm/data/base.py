@@ -31,6 +31,12 @@ class Example:
     sql_context: tuple[str, ...] = ()
     sql_context_clean: tuple[str, ...] = ()  # sql_context with INSERT statements stripped — see clean_context()
     sql_context_valid: bool | None = None
+    # Path to a real .sqlite file, relative to $DATA_PATH, that sql executes against — an
+    # alternative to embedding sql_context inline for sources where the real DB already
+    # exists on disk (e.g. walt.rm.data.synth) and duplicating its CREATE TABLE/INSERT INTO
+    # dump into every row would be wasteful. sql_context is left empty when this is set; see
+    # walt.utils.sql_exec.execute_with_context, which resolves either form transparently.
+    sql_context_path: str | None = None
     split: str = "trainval"  # "trainval" | "val" — RM training/CV never sees "val" rows
 
     def __post_init__(self) -> None:
@@ -52,6 +58,8 @@ class Example:
             d["sql_context_clean"] = list(self.sql_context_clean)
         if self.sql_context_valid is not None:
             d["sql_context_valid"] = self.sql_context_valid
+        if self.sql_context_path is not None:
+            d["sql_context_path"] = self.sql_context_path
         return d
 
     @staticmethod
@@ -71,6 +79,7 @@ class Example:
             sql_context=sql_context,
             sql_context_clean=sql_context_clean,
             sql_context_valid=d.get("sql_context_valid"),
+            sql_context_path=d.get("sql_context_path"),
             split=d.get("split", "trainval"),
         )
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import functools
 import logging
+from typing import Sequence
 
 import sqlglot
 import sqlglot.expressions as exp
@@ -38,8 +39,7 @@ def is_sql_valid(sql: str) -> bool:
         return False
 
 
-@functools.lru_cache(maxsize=None)
-def is_schema_valid(sql: str, sql_context: tuple[str, ...]) -> bool:
+def is_schema_valid(sql: str, sql_context: Sequence[str]) -> bool:
     """Whether `sql` actually executes (no error) against `sql_context` — catches what
     is_sql_valid's pure syntax check can't: a candidate that parses fine but references
     a table/column that doesn't exist in the schema, wrong arity, a type SQLite rejects,
@@ -55,7 +55,15 @@ def is_schema_valid(sql: str, sql_context: tuple[str, ...]) -> bool:
     feature, so a missing context never counts against a candidate.
 
     Cached on (sql, sql_context) since the same pair is scored repeatedly across
-    pairwise comparisons/CV folds."""
+    pairwise comparisons/CV folds. Callers pass sql_context as either a list or a
+    tuple (sql_agent.py's code path does both, depending on caller) — coerced to a
+    tuple here, before the cache boundary, since lru_cache needs a hashable key and a
+    list isn't one."""
+    return _is_schema_valid_cached(sql, tuple(sql_context))
+
+
+@functools.lru_cache(maxsize=None)
+def _is_schema_valid_cached(sql: str, sql_context: tuple[str, ...]) -> bool:
     if not sql_context:
         return True
     return run_sql(sql_context, sql).success
