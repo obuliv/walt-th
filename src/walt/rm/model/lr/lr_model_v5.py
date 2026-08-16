@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from walt.rm.model.lr_model_context import ContextAwareLRRewardModel
+from walt.rm.model.lr.lr_model_context import ContextAwareLRRewardModel
 
 
 class LRRewardModelV5(ContextAwareLRRewardModel):

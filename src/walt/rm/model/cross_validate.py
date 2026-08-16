@@ -18,12 +18,16 @@ from pathlib import Path
 from walt.rm.model.base import cross_validate, load_examples, publish_cv_summary
 from walt.rm.model.embeddings import SentenceTransformerEmbedding
 from walt.rm.model.gbm_model import GBMRewardModel
-from walt.rm.model.lr_model import SOLVER_BY_PENALTY, LRRewardModel
-from walt.rm.model.lr_model_v2 import LRRewardModelV2
-from walt.rm.model.lr_model_v3 import LRRewardModelV3
-from walt.rm.model.lr_model_v3_scaled import SCALING_CHOICES, LRRewardModelV3Scaled
-from walt.rm.model.lr_model_v4 import LRRewardModelV4
-from walt.rm.model.lr_model_v5 import LRRewardModelV5
+from walt.rm.model.lr import (
+    SCALING_CHOICES,
+    SOLVER_BY_PENALTY,
+    LRRewardModel,
+    LRRewardModelV2,
+    LRRewardModelV3,
+    LRRewardModelV3Scaled,
+    LRRewardModelV4,
+    LRRewardModelV5,
+)
 from walt.rm.model.tracking import log_run
 
 MODEL_CHOICES = ["lr_v1", "lr_v2", "lr_v3", "lr_v3_scaled", "lr_v4", "lr_v5", "gbm"]

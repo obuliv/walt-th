@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from walt.rm.model.lr_model import LRRewardModel
+from walt.rm.model.lr.lr_model import LRRewardModel
 from walt.rm.model.sql_features import is_sql_valid
 
 

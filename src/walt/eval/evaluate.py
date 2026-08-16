@@ -31,7 +31,7 @@ from walt.agent.sql_agent import SqlAgent, build_llm
 from walt.rm.data.base import Example
 from walt.rm.model.base import load_examples
 from walt.rm.model.embeddings import SentenceTransformerEmbedding
-from walt.rm.model.lr_model_v3 import LRRewardModelV3
+from walt.rm.model.lr.lr_model_v3 import LRRewardModelV3
 from walt.rm.model.tracking import log_run
 from walt.utils.sql_exec import ExecutionResult, run_sql
 

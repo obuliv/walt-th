@@ -10,10 +10,7 @@ from walt.rm.model.base import (
 )
 from walt.rm.model.embeddings import EmbeddingProvider, SentenceTransformerEmbedding
 from walt.rm.model.gbm_model import GBMRewardModel
-from walt.rm.model.lr_model import LRRewardModel
-from walt.rm.model.lr_model_v2 import LRRewardModelV2
-from walt.rm.model.lr_model_v3 import LRRewardModelV3
-from walt.rm.model.lr_model_v3_scaled import LRRewardModelV3Scaled
+from walt.rm.model.lr import LRRewardModel, LRRewardModelV2, LRRewardModelV3, LRRewardModelV3Scaled
 from walt.rm.model.tracking import load_runs, log_run
 
 __all__ = [

@@ -19,7 +19,7 @@ from walt.agent.llm.caching_llm import CachingLLM
 from walt.agent.llm.ollama_llm import OllamaLLM
 from walt.rm.model.base import BaseRewardModel, ScoredCandidate
 from walt.rm.model.embeddings import SentenceTransformerEmbedding
-from walt.rm.model.lr_model_v3 import LRRewardModelV3
+from walt.rm.model.lr.lr_model_v3 import LRRewardModelV3
 from walt.utils.sql_exec import ExecutionResult, run_sql
 
 

@@ -19,11 +19,7 @@ from pathlib import Path
 from walt.rm.model.base import group_split, load_examples, overfitting_gap
 from walt.rm.model.embeddings import SentenceTransformerEmbedding
 from walt.rm.model.gbm_model import GBMRewardModel
-from walt.rm.model.lr_model import LRRewardModel
-from walt.rm.model.lr_model_v2 import LRRewardModelV2
-from walt.rm.model.lr_model_v3 import LRRewardModelV3
-from walt.rm.model.lr_model_v4 import LRRewardModelV4
-from walt.rm.model.lr_model_v5 import LRRewardModelV5
+from walt.rm.model.lr import LRRewardModel, LRRewardModelV2, LRRewardModelV3, LRRewardModelV4, LRRewardModelV5
 from walt.rm.model.tracking import log_run
 
 MODEL_CHOICES = ["lr_v1", "lr_v2", "lr_v3", "lr_v4", "lr_v5", "gbm"]

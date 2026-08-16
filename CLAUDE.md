@@ -191,6 +191,10 @@ rows whose `sql_context_valid` was already computed `False` at extraction time �
 mode can't fix those (~532/2200 for gretel, mostly non-SQLite-dialect source schemas).
 
 **Reward model (`src/walt/rm/model/`)** scores/ranks SQL candidates for a question.
+All `lr_model*.py` files below (the LR variants and `sql_features`-adjacent
+`lr_model_context.py`) live under `rm/model/lr/`, not directly in `rm/model/` — moved
+there (2026-08-15) once the flat directory grew to 7 LR variants; import via
+`walt.rm.model.lr.lr_model_v3` or the re-exporting `walt.rm.model.lr` package `__init__`.
 `BaseRewardModel` (`base.py`) is algorithm-agnostic: question-level train/test split
 (`group_split` — splits by `Example`, never by pair, to avoid leaking a question's
 other candidates across the split), `rank()`/`evaluate()` (top-1 accuracy, pairwise
