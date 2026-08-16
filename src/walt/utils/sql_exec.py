@@ -8,6 +8,7 @@ candidate.
 from __future__ import annotations
 
 import sqlite3
+from collections import Counter
 from dataclasses import dataclass
 from typing import Sequence
 
@@ -36,5 +37,37 @@ def run_sql(context_statements: Sequence[str], sql: str, timeout: float = 5.0) -
         return ExecutionResult(success=True, columns=columns, rows=rows, error=None)
     except sqlite3.Error as exc:
         return ExecutionResult(success=False, columns=None, rows=None, error=str(exc))
+    finally:
+        conn.close()
+
+
+def capture_db_state(context_statements: Sequence[str], sql: str, timeout: float = 5.0) -> tuple[bool, dict[str, Counter] | None]:
+    """Executes context_statements followed by sql against a fresh in-memory SQLite DB,
+    then returns (True, state) where state is {table_or_view_name: Counter(rows)}
+    covering every row of every table/view afterward — or (False, None) on any
+    execution error.
+
+    For a statement that doesn't return a result set (UPDATE/DELETE/INSERT/CREATE VIEW/
+    etc — run_sql's rows is None for these), comparing two such statements' rows tells
+    you nothing: both are None regardless of what the statements actually did. This
+    compares their *effect* on the database instead. Counter (not a plain set) so
+    duplicate rows in a table aren't collapsed into one when comparing.
+    """
+    conn = sqlite3.connect(":memory:", timeout=timeout)
+    try:
+        cursor = conn.cursor()
+        for statement in context_statements:
+            cursor.execute(statement)
+        cursor.execute(sql)
+        conn.commit()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type IN ('table', 'view')")
+        names = [row[0] for row in cursor.fetchall()]
+        state = {}
+        for name in names:
+            cursor.execute(f'SELECT * FROM "{name}"')
+            state[name] = Counter(cursor.fetchall())
+        return True, state
+    except sqlite3.Error:
+        return False, None
     finally:
         conn.close()

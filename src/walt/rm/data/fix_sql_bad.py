@@ -60,17 +60,35 @@ from walt.rm.data.gen_training_data import (
     save_state,
     write_jsonl,
 )
-from walt.utils.sql_exec import run_sql
+from walt.utils.sql_exec import capture_db_state, run_sql
 
 # ---------------------------------------------------------------------------
 # Local detection: no LLM, pure SQL execution.
 # ---------------------------------------------------------------------------
 
 
+def _comparison_signal(context: list[str], sql: str, is_select: bool) -> tuple[bool, Any]:
+    """Returns (success, signal) — a comparable representation of what `sql` does
+    against `context`. For a SELECT-shaped sql_good (is_select=True), that's its result
+    rows: cheap, and the only thing that matters for a read query. For a non-SELECT
+    sql_good (UPDATE/DELETE/INSERT/CREATE VIEW/etc — run_sql's rows is None for these,
+    so two different such statements can't be told apart from rows alone), that's the
+    full database state after execution instead, via capture_db_state. Which branch is
+    used is decided once per row from sql_good's own shape and applied to every sql_bad
+    candidate too, so both sides are always compared the same way."""
+    if is_select:
+        result = run_sql(context, sql)
+        if not result.success:
+            return False, None
+        return True, (set(result.rows) if result.rows is not None else None)
+    return capture_db_state(context, sql)
+
+
 def find_flagged_indices(record: dict[str, Any]) -> list[int]:
-    """Indices into record['sql_bad'] whose execution result matches sql_good's, on
-    record['sql_context']. Empty if there's no sql_bad, sql_context_valid is falsy, or
-    sql_good itself fails to execute — nothing to compare against in those cases."""
+    """Indices into record['sql_bad'] whose execution result (or, for non-SELECT
+    sql_good, resulting database state) matches sql_good's, on record['sql_context'].
+    Empty if there's no sql_bad, sql_context_valid is falsy, or sql_good itself fails to
+    execute — nothing to compare against in those cases."""
     sql_bad = record.get("sql_bad") or []
     if not sql_bad or not record.get("sql_context_valid"):
         return []
@@ -78,12 +96,15 @@ def find_flagged_indices(record: dict[str, Any]) -> list[int]:
     good = run_sql(context, record["sql_good"])
     if not good.success:
         return []
-    good_rows = set(good.rows) if good.rows is not None else None
+    is_select = good.rows is not None
+    good_ok, good_signal = _comparison_signal(context, record["sql_good"], is_select)
+    if not good_ok:
+        return []
 
     flagged = []
     for i, bad in enumerate(sql_bad):
-        result = run_sql(context, bad["sql"])
-        if result.success and (set(result.rows) if result.rows is not None else None) == good_rows:
+        ok, signal = _comparison_signal(context, bad["sql"], is_select)
+        if ok and signal == good_signal:
             flagged.append(i)
     return flagged
 
@@ -377,7 +398,8 @@ def apply_fix(record: dict[str, Any], flagged_indices: list[int], result: dict[s
         # sql_good, fall back to the original context.
         context = original_context
         good = run_sql(context, record["sql_good"])
-    good_rows = set(good.rows) if good.rows is not None else None
+    is_select = good.rows is not None
+    good_ok, good_signal = _comparison_signal(context, record["sql_good"], is_select)
 
     # Only trust a drop for an index the LLM was actually shown as flagged — ignore any
     # hallucinated index outside that set.
@@ -389,9 +411,9 @@ def apply_fix(record: dict[str, Any], flagged_indices: list[int], result: dict[s
         if idx in drop:
             continue
         sql_bad.append(dict(bad))
-        if idx in flagged_indices:
-            candidate = run_sql(context, bad["sql"])
-            if candidate.success and (set(candidate.rows) if candidate.rows is not None else None) == good_rows:
+        if idx in flagged_indices and good_ok:
+            ok, signal = _comparison_signal(context, bad["sql"], is_select)
+            if ok and signal == good_signal:
                 still_unresolved.append(idx)
 
     merged = dict(record)
