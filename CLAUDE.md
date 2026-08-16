@@ -69,15 +69,31 @@ uv run python -m walt.rm.data.gen_training_data submit --input data/output/rm_da
 uv run python -m walt.rm.data.gen_training_data collect --batch-id msgbatch_xxx --output data/output/rm_enhanced.jsonl
 ```
 
+Retroactively fix `sql_bad` candidates that don't actually differ from `sql_good`'s
+result on their own `sql_context` (same test/submit/collect shape, but only rows with
+at least one such candidate are sent to the LLM — everything else passes through
+unchanged, and the full row set/order is always preserved in the output):
+```bash
+uv run python -m walt.rm.data.fix_sql_bad test --input data/output/gretel/gretel_enhanced.jsonl --limit 3
+uv run python -m walt.rm.data.fix_sql_bad submit --input data/output/gretel/gretel_enhanced.jsonl
+uv run python -m walt.rm.data.fix_sql_bad collect --batch-id msgbatch_xxx --output data/output/gretel/gretel_enhanced_fixed.jsonl
+```
+
 Train a pairwise-ranking reward model on `rm_enhanced.jsonl`, evaluate on a held-out
 split, and check the train/test gap for overfitting (`--model` selects `lr_v1`/`lr_v2`/
-`lr_v3`/`lr_v4`/`lr_v5`/`gbm` — v4/v5 also consume `sql_context`, see Architecture below
-for why neither beats v3 — default `lr_v3` with `--C 30`; see Architecture below for why):
+`lr_v3`/`lr_v4`/`lr_v5`/`gbm`/`distilbert` — v4/v5 also consume `sql_context`, see
+Architecture below for why neither beats v3, and `distilbert` fine-tunes
+`distilbert-base-cased` end to end via `--distilbert-*` flags, also not beating v3 —
+default `lr_v3` with `--C 30`; see Architecture below for why):
 ```bash
 uv run python -m walt.rm.model.train \
   --input data/output/rm_enhanced.jsonl \
   --model-output data/output/rm_model.joblib \
   --metrics-output data/output/rm_metrics.json
+
+# fine-tuned-transformer variant, run against the gretel-only dataset (see Architecture)
+uv run python -m walt.rm.model.distilbert_preflight --input data/output/gretel/gretel_enhanced.jsonl  # stop-and-check first: token lengths + MPS sanity
+uv run python -m walt.rm.model.train --input data/output/gretel/gretel_enhanced.jsonl --model distilbert --model-output data/output/rm_model_distilbert.pt
 ```
 
 A single 80/20 split is noisy (`--seed 7` vs `--seed 42` alone swung top1_accuracy by
@@ -408,6 +424,73 @@ a `model_factory` closure) — shares one pre-warmed embedding cache across all 
 (embedding a string doesn't depend on which fold it's in) rather than re-embedding
 per fold, so k-fold CV costs about the same wall-clock time as a single split.
 
+**Gretel-only scope (2026-08-15).** All work from this point on targets
+`data/output/gretel/gretel_enhanced.jsonl` exclusively (1666 rows: 1519 `trainval` /
+147 `val`, 4 more skipped for the usual `sql_good`-duplicates-`sql_bad` reason — 1662
+usable), not the combined spider/dbasql+gretel set used above. There was no lr_v3
+baseline trained purely on gretel data before this — every earlier "gretel" run was
+actually the combined set — so one was established fresh: 5-fold CV sweeping `C` from
+1 to 30000 found the same plateau pattern as the combined-set sweep but at a similar
+`C`, peaking at **`C=1000`** (top1 0.5624 ± 0.0104, pairwise 0.8624 ± 0.0064, mrr
+0.7571 ± 0.0072 — tightest variance of any `C` tried, consistent with the "more data
+supports less regularization" pattern already seen). Matched single 80/20 split
+(`seed=42`, same split later used for `DistilBertRewardModel` below): top1 0.5050,
+pairwise 0.8479, mrr 0.7286, overfitting gap +0.174/+0.062/+0.100 (wider than the
+combined-set gap — expected, gretel-only `trainval` is smaller: 1212 train rows).
+Per-category on this split: `unsafe_patterns` 0.937 (strongest, as everywhere else in
+this file), `misjoined_tables` 0.733 (weakest).
+
+**`DistilBertRewardModel` (`distilbert_model.py`) — first fine-tuned-transformer RM,
+does not beat `lr_v3` (2026-08-15).** Tries letting a model jointly attend over
+`(sql_context, question, sql)` in one forward pass instead of embedding each piece
+separately and combining via dot product, hypothesizing this would help most on
+schema-reasoning mistakes (`misjoined_tables`/`missing_filters`). Architecture:
+`distilbert-base-cased` (AutoModel, fully unfrozen) + a linear head on `[CLS]`,
+manually encoding `[CLS] sql_context [SEP] question [SEP] sql [SEP]` (DistilBERT has
+no `token_type_ids` — no segment embeddings — so segment structure comes purely from
+`[SEP]` positions + `attention_mask`; DistilBertTokenizer's native API only supports
+2-segment input, hence the manual construction). Trained genuinely pairwise, mirroring
+`LRRewardModel.fit`'s exact anti-positional-bias RNG pattern: `score_A`/`score_B` are
+two *independent* forward passes (each a single `(context, question, sql)` input), and
+only `BCEWithLogitsLoss(score_A - score_B, label)` combines them — unlike
+`GBMRewardModel`'s pointwise design (which exists because pairwise-differencing
+*features* into one joint nonlinear classifier loses per-candidate score
+decomposability), this stays a well-defined, always-transitive per-candidate scorer
+despite being nonlinear, since the model never sees A and B jointly.
+
+Two pre-flight checks (run before committing to a full fit(), see
+`distilbert_preflight.py`) came back clean: token length using the real tokenizer and
+format, 99.9% (8074/8079) of candidate sequences fit within 512 tokens untruncated
+(median 162, p95 321, max 514) — truncation is a non-issue here, so the simple
+truncate-`sql_context`-from-the-end fallback (no sqlglot-based schema filtering) was
+used as-is; and an MPS sanity check (real model/tokenizer, tiny 8-pair batch, 15
+forward+backward steps) showed no CPU-fallback ops, no errors, and a clean loss trend,
+confirming native MPS support on this hardware with no
+`PYTORCH_ENABLE_MPS_FALLBACK` needed.
+
+Full run (defaults: `lr=2e-5`, `batch_size=8`, `grad_accum_steps=2` [effective 16],
+`max_length=512`, early-stopping on validation `pairwise_accuracy` with
+`patience=3`, question-level internal 90/10 split via the existing `group_split`):
+stopped at epoch 7/15 (best weights from epoch 4 restored), ~30.3 min wall-clock on
+an Apple Silicon Mac Mini via MPS (peak RSS 1.2GB; the MPS allocator separately
+reported ~25.6GB, almost certainly inflated by caching-allocator pool growth across
+~5700 variably-shaped micro-batches from dynamic padding rather than real working
+set — RSS is the trustworthy figure here). On the same matched split as the gretel-
+only `lr_v3` baseline above: top1 0.4983, pairwise 0.8387, mrr 0.7213 — **all three
+slightly below `lr_v3`** (−0.007/−0.009/−0.007). Per-category: `unsafe_patterns` 0.967
+(+3.0pp vs `lr_v3`), `missing_filters` 0.826 (+0.2pp, flat), `wrong_aggregation` 0.801
+(−4.2pp), **`misjoined_tables` 0.698 (−3.5pp, the category the joint-attention
+hypothesis predicted would improve most — instead it's the one that got worse)**.
+Overfitting gap +0.322/+0.112/+0.184 — roughly 2x `lr_v3`'s on the identical split,
+unsurprising for a fully-unfrozen 66M-param backbone fine-tuned on only 1091 internal
+training examples (4724 pairs). Net: for this dataset size, `lr_v3` remains the
+better reward model — far cheaper (38s vs ~30min) and no worse on any category that
+matters. Not wired into `cross_validate.py` (no shared-cache path exists for it there
+— each fold would fully re-fit from scratch — and a single held-out split matching
+`lr_v3`'s shape was the goal here). The untried next lever, if this is revisited:
+freezing most of the backbone and fine-tuning only the top layers + head, which would
+cut both the overfitting gap and training cost — a different experiment from this one.
+
 **SQL agent (`src/walt/agent/`)** wires an LLM candidate generator to the RM and a toy
 SQLite executor: `agent/llm/base.py`'s `BaseLLM.generate_candidates(question,
 schema_context, n) -> list[str]` is the swappable interface; `agent/llm/ollama_llm.py`'s
@@ -516,3 +599,63 @@ repeats and sharpens: achieved-without-RM (59.0%, 23/39) clearly beats both
 achieved-with-RM (48.7%, 19/39) *and* the random-chance expectation (45.6%, 17.8/39) —
 RM reranking is worse than doing nothing, and only barely better than chance, on
 gretel's candidates specifically.
+
+**`sql_bad` label quality: ~48% of candidates weren't distinguishing negatives, mostly
+fixed by a 2nd-pass LLM step (2026-08-15).** An ad hoc audit of
+`gretel_enhanced.jsonl` — executing every `sql_good`/`sql_bad` pair against its own
+row's `sql_context` and diffing result sets — found 3,459/7,214 `sql_bad` candidates
+(47.9%, across 85.4% of rows) actually returned the *same* result as `sql_good`, for
+two distinct reasons: (1) sparse/homogeneous sample data (e.g. a `missing_filters`
+candidate drops `WHERE quarter = 1`, but every seeded row already has `quarter = 1`, so
+dropping it is a no-op on that data even though it's a real mistake in general), and (2)
+genuinely non-distinguishing SQL — a cosmetic rewrite (renamed alias, reordered clauses)
+that computes the same thing regardless of data. `fix_sql_bad.py` (new module,
+`test`/`submit`/`collect` shape matching `gen_training_data.py`) detects every flagged
+candidate locally via `run_sql` (no LLM needed for detection) and, per affected row,
+asks Claude to either append `sql_context` sample rows (case 1) or replace the
+candidate with a genuine different-result mistake in the same reason category (case 2),
+locally re-verifying the result before accepting it — never touching `sql_good`, never
+modifying/removing an existing `sql_context` statement. Run once against the full
+1,666-row dataset (1,423 rows sent to the LLM; 47 batch results failed validation and
+were left as their original, still-flagged content — no row is ever silently dropped,
+output line count always matches input): row-level flagged rate fell from 85.4% to
+39.3%, candidate-level from 47.9% to 18.1%.
+
+Caveat that surfaced during verification: the result-set comparison this relies on is
+blind to non-`SELECT` statements (`UPDATE`/`DELETE`/`INSERT`/`CREATE VIEW`, ~185/1,666
+rows here) — `run_sql` returns `rows=None` for those (no `cursor.description`), so two
+*different* UPDATE statements both look like a trivial "match" (`None == None`) even
+though they'd have completely different effects on real data. Restricting to the
+1,481 rows where `sql_good` is actually a `SELECT` (where the comparison is valid), the
+real improvement is: row-level flagged rate 83.7% → 31.7%, candidate-level 43.7% →
+10.5% — the non-`SELECT` rows are ~unchanged (184/185 before and after) because the fix
+pass's own detection has the same blind spot, so the LLM correctly had nothing
+meaningful to fix there. Properly verifying non-`SELECT` statements would need
+comparing database state before/after execution rather than a result set — not
+attempted here, out of scope for this pass.
+
+**`gen_training_data.py` strengthened to reduce how often rows need the fix pass above
+(2026-08-15).** Two changes: (1) `SYSTEM_PROMPT`/`BAD_ONLY_SYSTEM_PROMPT` now explicitly
+require every WHERE/HAVING/JOIN/aggregation condition appearing anywhere in `sql_good`
+or any `sql_bad` to actually matter for the sample data provided, and require mentally
+confirming each `sql_bad` candidate would execute to a genuinely different result before
+finalizing it — not just look different. (2) A new active mechanism,
+`needs_enrichment()`/`enrich_context()`: after a row is generated, if `sql_good` is a
+`SELECT`-shaped statement that executes successfully but returns zero rows, one
+follow-up `emit_context_enrichment` tool call asks for more `INSERT INTO` rows (append
+-only, existing tables only), locally re-verified before being accepted — wired into
+both `cmd_test` (immediately, synchronously) and `cmd_collect` (a pass over the merged
+batch results at the end); falls back to the original `sql_context` unchanged if the
+addition breaks `sql_good` or still returns zero rows, no retry loop. `needs_enrichment`
+deliberately checks `rows is not None and len(rows) == 0`, not just falsy `rows` — an
+earlier version used `not execution.rows`, which also (incorrectly) matched
+`rows=None` and fired on every DDL/`INSERT`/etc. row (~11% of gretel), asking the LLM to
+"enrich" a schema that was never empty in the first place; caught via `cmd_test`
+inspection before any real submit/collect run used it. Note this enrichment step runs
+*after* `sql_bad` is already generated in the same call, so it doesn't guarantee
+already-generated candidates stay meaningfully different post-enrichment (confirmed
+directly: a `>` vs `>=` `missing_filters` candidate stayed a false negative because the
+enrichment call, unaware of that candidate, added data that didn't happen to fall in the
+boundary) — closing that fully would mean re-verifying `sql_bad` after enrichment too,
+which `fix_sql_bad.py` above already does generically and can be re-run on any future
+output if needed, so it wasn't duplicated here.

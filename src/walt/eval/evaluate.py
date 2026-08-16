@@ -30,9 +30,12 @@ from typing import Any
 from walt.agent.sql_agent import SqlAgent, build_llm
 from walt.rm.data.base import Example
 from walt.rm.model.base import load_examples
+from walt.rm.model.distilbert_model import DistilBertRewardModel
 from walt.rm.model.embeddings import SentenceTransformerEmbedding
 from walt.rm.model.lr.lr_model_v3 import LRRewardModelV3
 from walt.rm.model.tracking import log_run
+
+RM_CLASS_CHOICES = ["lr_v3", "distilbert"]
 from walt.utils.sql_exec import ExecutionResult, run_sql
 
 
@@ -154,6 +157,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--input", type=Path, default=Path("data/output/rm_enhanced.jsonl"))
     parser.add_argument("--rm-model", type=Path, default=Path("data/output/rm_model.joblib"))
+    parser.add_argument("--rm-class", choices=RM_CLASS_CHOICES, default="lr_v3", help="Which BaseRewardModel subclass --rm-model was saved from")
     parser.add_argument("--ollama-model", default="llama3.2")
     parser.add_argument("--n-candidates", type=int, default=5)
     parser.add_argument("--limit", type=int, default=None, help="Only evaluate the first N val rows (smoke testing)")
@@ -172,8 +176,11 @@ def main() -> None:
         val_examples = val_examples[: args.limit]
     print(f"Evaluating on {len(val_examples)} val examples")
 
-    embedding_provider = SentenceTransformerEmbedding()
-    rm = LRRewardModelV3.load(args.rm_model, embedding_provider=embedding_provider)
+    if args.rm_class == "distilbert":
+        rm = DistilBertRewardModel.load(args.rm_model)
+    else:
+        embedding_provider = SentenceTransformerEmbedding()
+        rm = LRRewardModelV3.load(args.rm_model, embedding_provider=embedding_provider)
     rm.warm_cache(val_examples)
 
     rm_metrics = rm.evaluate(val_examples)
@@ -228,6 +235,7 @@ def main() -> None:
             config={
                 "input": str(args.input),
                 "rm_model": str(args.rm_model),
+                "rm_class": args.rm_class,
                 "ollama_model": args.ollama_model,
                 "n_candidates": args.n_candidates,
                 "n_val_examples": len(val_examples),

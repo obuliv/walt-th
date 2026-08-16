@@ -17,12 +17,14 @@ import time
 from pathlib import Path
 
 from walt.rm.model.base import group_split, load_examples, overfitting_gap
+from walt.rm.model.distilbert_model import DEFAULT_MODEL_NAME as DISTILBERT_DEFAULT_MODEL_NAME
+from walt.rm.model.distilbert_model import DistilBertRewardModel
 from walt.rm.model.embeddings import SentenceTransformerEmbedding
 from walt.rm.model.gbm_model import GBMRewardModel
 from walt.rm.model.lr import LRRewardModel, LRRewardModelV2, LRRewardModelV3, LRRewardModelV4, LRRewardModelV5
 from walt.rm.model.tracking import log_run
 
-MODEL_CHOICES = ["lr_v1", "lr_v2", "lr_v3", "lr_v4", "lr_v5", "gbm"]
+MODEL_CHOICES = ["lr_v1", "lr_v2", "lr_v3", "lr_v4", "lr_v5", "gbm", "distilbert"]
 
 
 def main() -> None:
@@ -45,6 +47,17 @@ def main() -> None:
     parser.add_argument("--gbm-max-iter", type=int, default=200, help="[gbm only] number of boosting rounds")
     parser.add_argument("--gbm-max-depth", type=int, default=None, help="[gbm only] max tree depth (None = sklearn default)")
     parser.add_argument("--gbm-learning-rate", type=float, default=0.1, help="[gbm only]")
+    parser.add_argument("--distilbert-model-name", default=DISTILBERT_DEFAULT_MODEL_NAME, help="[distilbert only] HF model id for the backbone")
+    parser.add_argument("--distilbert-epochs", type=int, default=15, help="[distilbert only] max epochs (early stopping usually stops sooner)")
+    parser.add_argument("--distilbert-lr", type=float, default=2e-5, help="[distilbert only] AdamW learning rate")
+    parser.add_argument("--distilbert-batch-size", type=int, default=8, help="[distilbert only] pairs per micro-batch (2x forward passes)")
+    parser.add_argument("--distilbert-grad-accum-steps", type=int, default=2, help="[distilbert only] gradient accumulation steps")
+    parser.add_argument("--distilbert-max-length", type=int, default=512, help="[distilbert only] max token sequence length")
+    parser.add_argument("--distilbert-warmup-ratio", type=float, default=0.1, help="[distilbert only] fraction of total steps spent warming up")
+    parser.add_argument("--distilbert-weight-decay", type=float, default=0.01, help="[distilbert only] AdamW weight decay")
+    parser.add_argument("--distilbert-val-fraction", type=float, default=0.1, help="[distilbert only] internal question-level split for early stopping")
+    parser.add_argument("--distilbert-early-stop-patience", type=int, default=3, help="[distilbert only] epochs without improvement before stopping")
+    parser.add_argument("--distilbert-early-stop-metric", choices=["pairwise_accuracy", "loss"], default="pairwise_accuracy", help="[distilbert only] early-stopping criterion")
     args = parser.parse_args()
     run_start = time.perf_counter()
 
@@ -58,7 +71,9 @@ def main() -> None:
         f"{len(train_examples)} train / {len(test_examples)} test"
     )
 
-    embedding_provider = SentenceTransformerEmbedding(model_name=args.embedding_model, device=args.device)
+    embedding_provider = (
+        None if args.model == "distilbert" else SentenceTransformerEmbedding(model_name=args.embedding_model, device=args.device)
+    )
     if args.model == "lr_v1":
         model = LRRewardModel(embedding_provider=embedding_provider, seed=args.seed, C=args.C)
     elif args.model == "lr_v2":
@@ -76,6 +91,22 @@ def main() -> None:
         model = LRRewardModelV4(embedding_provider=embedding_provider, seed=args.seed, C=args.C)
     elif args.model == "lr_v5":
         model = LRRewardModelV5(embedding_provider=embedding_provider, seed=args.seed, C=args.C)
+    elif args.model == "distilbert":
+        model = DistilBertRewardModel(
+            model_name=args.distilbert_model_name,
+            seed=args.seed,
+            device=args.device,
+            max_length=args.distilbert_max_length,
+            learning_rate=args.distilbert_lr,
+            num_epochs=args.distilbert_epochs,
+            batch_size=args.distilbert_batch_size,
+            grad_accum_steps=args.distilbert_grad_accum_steps,
+            warmup_ratio=args.distilbert_warmup_ratio,
+            weight_decay=args.distilbert_weight_decay,
+            val_fraction=args.distilbert_val_fraction,
+            early_stop_patience=args.distilbert_early_stop_patience,
+            early_stop_metric=args.distilbert_early_stop_metric,
+        )
     else:
         model = GBMRewardModel(
             embedding_provider=embedding_provider,
@@ -112,7 +143,11 @@ def main() -> None:
     print(f"\nSaved model to {args.model_output}")
 
     if not args.no_log_run:
-        run_name = args.run_name or f"{args.model}_{args.embedding_model.split('/')[-1]}"
+        run_name = args.run_name or (
+            f"distilbert_{args.distilbert_model_name.split('/')[-1]}"
+            if args.model == "distilbert"
+            else f"{args.model}_{args.embedding_model.split('/')[-1]}"
+        )
         run_path = log_run(
             args.runs_dir,
             run_name=run_name,
@@ -140,6 +175,23 @@ def main() -> None:
                 **(
                     {"gbm_max_iter": args.gbm_max_iter, "gbm_max_depth": args.gbm_max_depth, "gbm_learning_rate": args.gbm_learning_rate}
                     if args.model == "gbm"
+                    else {}
+                ),
+                **(
+                    {
+                        "distilbert_model_name": args.distilbert_model_name,
+                        "distilbert_epochs": args.distilbert_epochs,
+                        "distilbert_lr": args.distilbert_lr,
+                        "distilbert_batch_size": args.distilbert_batch_size,
+                        "distilbert_grad_accum_steps": args.distilbert_grad_accum_steps,
+                        "distilbert_max_length": args.distilbert_max_length,
+                        "distilbert_warmup_ratio": args.distilbert_warmup_ratio,
+                        "distilbert_weight_decay": args.distilbert_weight_decay,
+                        "distilbert_val_fraction": args.distilbert_val_fraction,
+                        "distilbert_early_stop_patience": args.distilbert_early_stop_patience,
+                        "distilbert_early_stop_metric": args.distilbert_early_stop_metric,
+                    }
+                    if args.model == "distilbert"
                     else {}
                 ),
             },
