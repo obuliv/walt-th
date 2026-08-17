@@ -4,10 +4,10 @@ sqlglot-AST sql_bad corruptions (missing_filters/wrong_aggregation/unsafe_patter
 misjoined_tables/compound — no LLM involved).
 
 Setup (one-time, manual): download the official Spider release from
-https://yale-lily.github.io/spider (the SQLite database corpus is only distributed via a
-Google Drive link there — not something worth automating) and place its contents,
-including the database/ folder and train_spider.json/train_others.json/dev.json, under
-$DATA_PATH/spider (i.e. data/spider/ by default).
+https://www.kaggle.com/datasets/jeromeblanchet/yale-universitys-spider-10-nlp-dataset
+and place its contents, including the database/ folder and
+train_spider.json/train_others.json/dev.json, under $DATA_PATH/spider (i.e. data/spider/
+by default).
 
 trainval rows are sourced from train_spider.json + train_others.json's 146 databases;
 val rows are sourced from dev.json's 20 databases — Spider's own train/dev split, which

@@ -1,7 +1,7 @@
-"""Loads the official Spider release from a local directory (no network fetch — the real
-per-database SQLite corpus is only distributed via a Google Drive link on
-https://yale-lily.github.io/spider, not something worth automating; see build_synth_dataset.py
-docstring for the manual setup step), scores/selects databases, and extracts+annotates DDL.
+"""Loads the official Spider release from a local directory (no network fetch — download
+from https://www.kaggle.com/datasets/jeromeblanchet/yale-universitys-spider-10-nlp-dataset,
+not something worth automating; see build_synth_dataset.py docstring for the manual setup
+step), scores/selects databases, and extracts+annotates DDL.
 
 Expected layout under spider_dir (the official release's own layout):
     database/<db_id>/<db_id>.sqlite
@@ -55,8 +55,8 @@ def discover_local_dbs(spider_dir: Path) -> dict[str, Path]:
     if not database_dir.is_dir():
         raise FileNotFoundError(
             f"{database_dir} not found. Download the official Spider release from "
-            f"https://yale-lily.github.io/spider and place its contents (including the "
-            f"database/ folder) under {spider_dir}."
+            f"https://www.kaggle.com/datasets/jeromeblanchet/yale-universitys-spider-10-nlp-dataset "
+            f"and place its contents (including the database/ folder) under {spider_dir}."
         )
     dbs = {}
     for db_dir in sorted(database_dir.iterdir()):

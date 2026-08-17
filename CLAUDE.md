@@ -34,7 +34,7 @@ Gotchas:
 - The agent needs a local Ollama server with `llama3.2` pulled (`ollama pull llama3.2`) —
   no API key, no network at inference time.
 - `walt.rm.data.synth` needs the official Spider release at `$DATA_PATH/spider/`
-  (download from https://yale-lily.github.io/spider — Google Drive only, not automatable)
+  (download from https://www.kaggle.com/datasets/jeromeblanchet/yale-universitys-spider-10-nlp-dataset)
   extracted so `$DATA_PATH/spider/database/<db_id>/<db_id>.sqlite` and
   `$DATA_PATH/spider/{train_spider,train_others,dev}.json` exist. Gitignored, one-time
   manual step; every other raw source is committed or self-downloaded.
