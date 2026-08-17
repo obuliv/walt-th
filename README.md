@@ -52,6 +52,6 @@ scripts/evaluate_best.sh --output-dir experiments/run1
 `sql_bad` from llama3.2's real mistakes, a Claude pass to assign reason/severity to
 each candidate (pauses for confirmation before submitting — it's a real, billed
 Anthropic Message Batch), filter to llama3.2-only candidates, sweep `C` for
-`lr_v6 --ignore-sql-good --drop-bad-vs-bad-pairs`, then train the final model. Takes a while (Ollama
-generation + a Claude batch + several CV folds); see the script's header comment for
-the full breakdown.
+`lr_v6 --ignore-sql-good --drop-bad-vs-bad-pairs`, then train the final model. Takes
+a while (Ollama generation + a Claude batch + several CV folds); see the script's
+header comment for the full breakdown.
