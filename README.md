@@ -26,7 +26,31 @@ Also required to run the agent/eval (not just train the RM):
   https://www.kaggle.com/datasets/jeromeblanchet/yale-universitys-spider-10-nlp-dataset), extracted
   so `$DATA_PATH/spider/database/<db_id>/<db_id>.sqlite` and
   `$DATA_PATH/spider/{train_spider,train_others,dev}.json` exist. One-time manual step.
+## Latest Benchmark
+```commandline
+$ ./scripts/evaluate_best.sh --output-dir runs/demo
+Running constant+schema-filter baseline (log: runs/demo/eval_baseline.log)...
+Running trained model + schema-filter (log: runs/demo/eval_trained.log)...
+Sample log (50 rows): runs/demo/eval_samples.md
 
+== Funnel: no rerank -> constant+schema-filter -> trained model+schema-filter ==
+
+SQL execution pass rate:
+  no rerank                       : 216/300 (72.0%)
+  constant + schema-filter        : 286/300 (95.3%)
+  trained + schema-filter         : 286/300 (95.3%)
+
+End-to-end QA accuracy:
+  no rerank                       : 139/300 (46.3%)
+  constant + schema-filter        : 168/300 (56.0%)
+  trained + schema-filter         : 177/300 (59.0%)
+
+Oracle mixed-bucket achieved (rows where selection actually matters):
+  no rerank                       : 91/156 (58.3%)
+  constant + schema-filter        : 120/156 (76.9%)
+  trained + schema-filter         : 129/156 (82.7%)
+  expected by random pick         : 80.8/156 (51.8%)
+```
 ## Fastest path: run eval on the checked-in demo model
 
 [`runs/demo/`](runs/demo/) has a pre-trained RM (best-known config — see its README)

@@ -194,6 +194,11 @@ cython_debug/
 data/output/*.joblib
 data/output/runs/*.png
 
+# scripts/evaluate_best.sh's intermediate raw --samples-json dumps, merged into
+# eval_samples.md and not meant to be kept themselves
+.eval_samples_baseline.json
+.eval_samples_trained.json
+
 # Abstra
 #   Abstra is an AI-powered process automation framework.
 #   Ignore directories containing user credentials, local state, and settings.

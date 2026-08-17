@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import sys
 import time
 from pathlib import Path
@@ -88,6 +89,20 @@ def _rows_match(a: ExecutionResult, b: ExecutionResult) -> bool | None:
     return sorted(a.rows, key=_row_sort_key) == sorted(b.rows, key=_row_sort_key)
 
 
+MAX_SAMPLE_ROWS = 20  # cap on rows embedded per execution in a --sample-log entry
+
+
+def _execution_detail(execution: ExecutionResult) -> dict[str, Any]:
+    if execution.rows is None:
+        return {"success": execution.success, "rows": None, "n_rows": None, "error": execution.error}
+    return {
+        "success": execution.success,
+        "rows": [list(r) for r in execution.rows[:MAX_SAMPLE_ROWS]],
+        "n_rows": len(execution.rows),
+        "error": execution.error,
+    }
+
+
 def _effect_match(context_statements: Sequence[str], sql_a: str, sql_b: str) -> bool:
     """Fallback for _rows_match's None case (both statements are non-SELECT, so neither
     has a row set to compare): re-runs context_statements + each statement from scratch
@@ -103,9 +118,19 @@ def _rate(count: int, total: int) -> dict[str, Any]:
     return {"count": count, "total": total, "rate": count / total if total else None}
 
 
-def evaluate_agent(val_examples: list[Example], agent: SqlAgent) -> dict[str, Any]:
+def evaluate_agent(
+    val_examples: list[Example], agent: SqlAgent, sample_n: int = 0, sample_seed: int = 42
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Returns (metrics, samples) -- samples is a list of per-row detail dicts (question,
+    expected vs. actual SQL/results, both with and without RM reranking) for `sample_n`
+    rows chosen uniformly at random (seeded by `sample_seed`, so a repeat run with the
+    same inputs picks the same rows) from the executable set, for human review. Empty
+    when sample_n is 0 (the default) -- capturing costs nothing extra since every value
+    in a sample dict is already computed for the aggregate metrics either way."""
     executable = [ex for ex in val_examples if ex.sql_context or ex.sql_context_path]
     qa_examples = [ex for ex in executable if ex.sql_context_valid]
+    sample_indices = set(random.Random(sample_seed).sample(range(len(executable)), min(sample_n, len(executable))))
+    samples: list[dict[str, Any]] = []
 
     # Rows that carry sql_context_path (see walt.utils.sql_exec.execute_with_context)
     # reuse a cached in-memory connection across calls that share the same path — sorting
@@ -218,6 +243,27 @@ def evaluate_agent(val_examples: list[Example], agent: SqlAgent) -> dict[str, An
                 mixed_base_correct += int(base_correct)
                 mixed_expected_random += n_correct / n_candidates
 
+        if (i - 1) in sample_indices:
+            if ex.sql_context_valid:
+                oracle_bucket = "all_correct" if n_correct == n_candidates else "zero_correct" if n_correct == 0 else "mixed"
+                reference_detail = _execution_detail(reference)
+            else:
+                rm_correct = base_correct = oracle_bucket = None
+                reference_detail = None
+            samples.append(
+                {
+                    "index": i,
+                    "question": ex.question,
+                    "schema": list(ex.sql_context_clean),
+                    "sql_good": ex.sql_good,
+                    "context_valid": ex.sql_context_valid,
+                    "reference": reference_detail,
+                    "with_rm": {"sql": result.best_sql, **_execution_detail(rm_execution), "correct": rm_correct},
+                    "without_rm": {"sql": baseline_sql, **_execution_detail(base_execution), "correct": base_correct},
+                    "oracle_bucket": oracle_bucket,
+                }
+            )
+
         if i % 10 == 0 or i == len(executable):
             print(
                 f"  [{i}/{len(executable)}] pass so far — with RM: {rm_pass}/{i} "
@@ -225,7 +271,7 @@ def evaluate_agent(val_examples: list[Example], agent: SqlAgent) -> dict[str, An
                 flush=True,
             )
 
-    return {
+    metrics = {
         "sql_pass_rate": {
             "with_rm": _rate(rm_pass, len(executable)),
             "without_rm": _rate(base_pass, len(executable)),
@@ -250,6 +296,81 @@ def evaluate_agent(val_examples: list[Example], agent: SqlAgent) -> dict[str, An
             },
         },
     }
+    return metrics, samples
+
+
+def _append_rows_block(lines: list[str], detail: dict[str, Any], label: str = "Rows") -> None:
+    if not detail["success"]:
+        lines.append(f"❌ execution error: `{detail['error']}`")
+        return
+    if detail["rows"] is None:
+        lines.append("_(non-SELECT statement — no row set)_")
+        return
+    if not detail["rows"]:
+        lines.append("_(0 rows)_")
+        return
+    lines.append(f"{label}:")
+    lines.append("```")
+    lines.extend(repr(tuple(r)) for r in detail["rows"])
+    if detail["n_rows"] > len(detail["rows"]):
+        lines.append(f"... and {detail['n_rows'] - len(detail['rows'])} more row(s)")
+    lines.append("```")
+
+
+def _append_execution_section(lines: list[str], title: str, sql: str, detail: dict[str, Any], correct: bool | None) -> None:
+    lines.append(f"**{title}:**")
+    lines.append("```sql")
+    lines.append(sql)
+    lines.append("```")
+    _append_rows_block(lines, detail)
+    if correct is not None:
+        lines.append(f"QA correct: {'✅ yes' if correct else '❌ no'}")
+    lines.append("")
+
+
+def write_samples_md(samples: list[dict[str, Any]], path: Path, args: argparse.Namespace) -> None:
+    """Human-readable Markdown log of --sample-log's randomly sampled rows: question,
+    schema, expected (sql_good) vs. actual SQL/results with and without RM reranking,
+    and the oracle bucket that row falls into. Row content (execution success/rows/
+    error) is exactly what evaluate_agent() already computed for the aggregate
+    metrics — this just renders a subset of it for human review instead of collapsing
+    it into counts."""
+    lines = [
+        "# Eval sample log",
+        "",
+        f"- input: `{args.input}`",
+        f"- rm-model: `{args.rm_model}` (`{args.rm_class}`, schema-filter={args.schema_filter})",
+        f"- {len(samples)} row(s) sampled (seed={args.sample_seed})",
+        "",
+    ]
+    for s in samples:
+        lines.append(f"## Row {s['index']}: {s['question']}")
+        lines.append("")
+        lines.append("**Schema:**")
+        lines.append("```sql")
+        lines.append("\n".join(s["schema"]))
+        lines.append("```")
+        lines.append("")
+        lines.append("**Expected (`sql_good`):**")
+        lines.append("```sql")
+        lines.append(s["sql_good"])
+        lines.append("```")
+        if s["reference"] is None:
+            lines.append("_expected rows not verified (`sql_context_valid=False` for this row)_")
+        else:
+            _append_rows_block(lines, s["reference"], label="Expected rows")
+        lines.append("")
+
+        _append_execution_section(lines, "With RM reranking", s["with_rm"]["sql"], s["with_rm"], s["with_rm"]["correct"])
+        _append_execution_section(lines, "Without RM (first candidate)", s["without_rm"]["sql"], s["without_rm"], s["without_rm"]["correct"])
+
+        lines.append(f"Oracle bucket: `{s['oracle_bucket'] or 'n/a'}`")
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines))
 
 
 def main() -> None:
@@ -276,6 +397,10 @@ def main() -> None:
     parser.add_argument("--runs-dir", type=Path, default=Path("data/output/eval_runs"), help="Directory where agent-eval run records are logged for later comparison (separate from RM training's data/output/runs/ — different metric shape)")
     parser.add_argument("--no-log-run", action="store_true", help="Skip writing a run record (e.g. for throwaway/debug runs)")
     parser.add_argument("--schema-filter", action="store_true", help="Wrap --rm-model in SchemaFilteredRewardModel — a hard is_schema_valid pre-filter applied before the RM's own scoring (see schema_filter.py). No-op for lr_v6 (already learns this internally); meant for models with no equivalent feature, e.g. distilbert")
+    parser.add_argument("--sample-log", type=int, default=0, help="Write a human-readable Markdown log of N randomly sampled rows (question, expected vs. actual SQL/results, with and without RM reranking) — see --sample-log-output. 0 (default) disables this.")
+    parser.add_argument("--sample-log-output", type=Path, default=None, help="Where to write the --sample-log Markdown file. Defaults to --output with its suffix replaced by _samples.md, or data/output/eval_samples.md if --output isn't given.")
+    parser.add_argument("--sample-seed", type=int, default=42, help="Seed for --sample-log's row selection — same seed + same input file (same executable row order) always picks the same rows, even across separate --rm-model runs -- lets a caller merge two runs' samples by row index (see scripts/evaluate_best.sh's 3-way with-RM/plain-filter/no-rerank merge)")
+    parser.add_argument("--samples-json", type=Path, default=None, help="[--sample-log only] also dump the raw sampled-row list as JSON here (machine-readable; --sample-log-output's Markdown is for humans) -- e.g. so a wrapper script can merge two separate runs' samples (matched by row index) into one comparison")
     args = parser.parse_args()
 
     examples = load_examples(args.input)
@@ -309,7 +434,7 @@ def main() -> None:
         llm_cache_path = Path("data/output") / default_cache_name
     llm = build_llm(llm_model, llm_cache_path, backend=args.llm_backend, ollama_concurrency=args.ollama_concurrency)
     agent = SqlAgent(llm=llm, rm=rm, n_candidates=args.n_candidates, strip_llm_context=args.strip_context)
-    agent_metrics = evaluate_agent(val_examples, agent)
+    agent_metrics, samples = evaluate_agent(val_examples, agent, sample_n=args.sample_log, sample_seed=args.sample_seed)
 
     def _print_line(label: str, stats: dict[str, Any]) -> None:
         rate = f" ({stats['rate']:.1%})" if stats["rate"] is not None else ""
@@ -344,6 +469,17 @@ def main() -> None:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(summary, indent=2))
         print(f"\nWrote summary to {args.output}")
+
+    if args.sample_log:
+        sample_log_output = args.sample_log_output or (
+            args.output.with_name(f"{args.output.stem}_samples.md") if args.output else Path("data/output/eval_samples.md")
+        )
+        write_samples_md(samples, sample_log_output, args)
+        print(f"Wrote {len(samples)} sample row(s) to {sample_log_output}")
+        if args.samples_json:
+            args.samples_json.parent.mkdir(parents=True, exist_ok=True)
+            args.samples_json.write_text(json.dumps(samples, indent=2))
+            print(f"Wrote raw sample data to {args.samples_json}")
 
     if not args.no_log_run:
         run_name = args.run_name or f"{args.rm_model.stem}_{args.llm_backend}_{llm_model}"
