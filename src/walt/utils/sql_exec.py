@@ -40,6 +40,20 @@ def _is_insert(statement: str) -> bool:
         return statement.strip().upper().startswith("INSERT")
 
 
+@functools.lru_cache(maxsize=None)
+def normalize_sql(sql: str) -> str:
+    """Renders sql through a sqlglot parse/print round-trip (dialect="sqlite") so two
+    queries that only differ in capitalization/whitespace/formatting normalize to
+    identical text. Falls back to the original (stripped) text on a parse error rather
+    than raising — callers that need to distinguish "parsed fine" from "fell back"
+    should parse separately (e.g. is_sql_valid). Cached since callers hit this
+    repeatedly for the same sql_good/sql_bad strings across an embedding pass."""
+    try:
+        return sqlglot.parse_one(sql, dialect="sqlite").sql(dialect="sqlite")
+    except Exception:
+        return sql.strip()
+
+
 def clean_context(context_statements: Sequence[str]) -> tuple[str, ...]:
     """Drops INSERT statements from context_statements, keeping only schema-defining
     ones (CREATE TABLE and any other non-INSERT statement, e.g. CREATE VIEW/INDEX) — the

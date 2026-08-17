@@ -37,6 +37,7 @@ import anthropic
 import jsonschema
 from dotenv import load_dotenv
 
+from walt.utils.jsonl_io import open_jsonl
 from walt.utils.sql_exec import clean_context, run_sql
 
 load_dotenv()
@@ -528,8 +529,9 @@ def enrich_context(client: anthropic.Anthropic, record: dict[str, Any]) -> dict[
 
 
 def load_records(input_path: Path) -> list[dict[str, Any]]:
+    """input_path may end in .gz for a gzip-compressed file -- read transparently either way."""
     records = []
-    with input_path.open(encoding="utf-8") as f:
+    with open_jsonl(input_path) as f:
         for line in f:
             line = line.strip()
             if line:
@@ -538,8 +540,9 @@ def load_records(input_path: Path) -> list[dict[str, Any]]:
 
 
 def write_jsonl(records: Iterable[dict[str, Any]], output_path: Path) -> None:
+    """output_path may end in .gz to write gzip-compressed instead of plain text."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("w", encoding="utf-8") as f:
+    with open_jsonl(output_path, "wt") as f:
         for record in records:
             f.write(json.dumps(record) + "\n")
 

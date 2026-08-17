@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Callable
 
 from walt.rm.data.base import Example
+from walt.utils.jsonl_io import open_jsonl
 
 
 def load_examples(path: str | Path, stats: dict | None = None) -> list[Example]:
@@ -21,10 +22,11 @@ def load_examples(path: str | Path, stats: dict | None = None) -> list[Example]:
     Rows that fail Example's validation (e.g. sql_good duplicating a sql_bad entry, a
     labeling mistake seen in the LLM-generated negatives) are skipped with a warning
     rather than aborting the whole load. If `stats` is given, it's filled in with
-    {n_rows_total, n_rows_skipped} for callers that want to record it (e.g. in a run log)."""
+    {n_rows_total, n_rows_skipped} for callers that want to record it (e.g. in a run log).
+    `path` may end in .gz for a gzip-compressed file -- read transparently either way."""
     examples = []
     skipped = 0
-    with Path(path).open(encoding="utf-8") as f:
+    with open_jsonl(path) as f:
         for line in f:
             line = line.strip()
             if not line:

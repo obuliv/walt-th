@@ -19,7 +19,7 @@ import sqlglot
 import sqlglot.expressions as exp
 
 from walt.rm.data.synth.schema import Schema, build_schema
-from walt.utils.sql_exec import build_connection, execute_on_connection, load_context_from_sqlite
+from walt.utils.sql_exec import build_connection, execute_on_connection, load_context_from_sqlite, normalize_sql
 
 
 @dataclass(frozen=True)
@@ -36,7 +36,7 @@ def load_pairs(spider_dir: Path, files: Sequence[str]) -> list[SpiderPair]:
             rows = json.load(f)
         for row in rows:
             question = row["question"].strip()
-            sql_good = row["query"].strip()
+            sql_good = normalize_sql(row["query"].strip())
             if not question or not sql_good:
                 continue
             pairs.append(SpiderPair(db_id=row["db_id"], question=question, sql_good=sql_good))

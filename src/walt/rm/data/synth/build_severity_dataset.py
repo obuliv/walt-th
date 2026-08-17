@@ -56,6 +56,7 @@ from walt.rm.data.synth.spider_source import (
     select_dbs_for_target,
     shortlist_candidates,
 )
+from walt.utils.jsonl_io import open_jsonl
 
 load_dotenv()
 
@@ -245,8 +246,9 @@ def build_pool(
 
 
 def write_jsonl(rows: list[dict[str, Any]], output_path: Path) -> None:
+    """output_path may end in .gz to write gzip-compressed instead of plain text."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("w", encoding="utf-8") as f:
+    with open_jsonl(output_path, "wt") as f:
         for row in rows:
             f.write(json.dumps(row) + "\n")
 

@@ -54,7 +54,9 @@ def main() -> None:
     parser.add_argument("--no-log-run", action="store_true", help="Skip writing a run record (e.g. for throwaway/debug runs)")
     parser.add_argument("--C", type=float, default=300.0, help="[lr_v1/lr_v2/.../lr_v6 only] LogisticRegression inverse regularization strength — 300 is CV-tuned for lr_v6 on gretel-only data (sklearn's own default is 1.0); other models/datasets were tuned separately, see CLAUDE.md")
     parser.add_argument("--severity-zero-as-positive", action="store_true", help="[lr_v1/lr_v3/lr_v4/lr_v5/lr_v6/lr_v7 only] treat severity==0 sql_bad candidates (from enhance_severity_dataset.py) as extra positive anchors paired against every real bad, instead of excluding them from every pair. No-op on datasets without severity.")
+    parser.add_argument("--ignore-sql-good", action="store_true", help="[lr_v1/lr_v3/lr_v4/lr_v5/lr_v6/lr_v7 only] drop sql_good from positive_anchors entirely and use ONLY severity==0 sql_bad candidates as the positive anchor (forces severity_zero_as_positive's effect on regardless of its own flag). A row with no severity==0 candidate contributes zero good-vs-bad pairs (its ranked-bad-vs-ranked-bad pairs, if any, are unaffected). evaluate() is unchanged — still ranks against the real sql_good.")
     parser.add_argument("--embedding-diff-mode", choices=EMBEDDING_DIFF_MODES, default="cosine", help="[lr_v7 only] how the commands/args-vs-question embedding comparison is folded into phi: 'cosine' (2 scalar cosine similarities) or 'raw' (2x768 raw vector differences)")
+    parser.add_argument("--v7-schema-valid", dest="v7_schema_valid", action="store_true", help="[lr_v7 only] append is_schema_valid(sql, sql_context) to phi_v7 (V7 excludes it by default, unlike lr_v6)")
     parser.add_argument("--v2-cosine-sim", dest="v2_cosine_sim", action=argparse.BooleanOptionalAction, default=True, help="[lr_v2 only] include the cosine-similarity interaction feature")
     parser.add_argument("--v2-dot-product", dest="v2_dot_product", action=argparse.BooleanOptionalAction, default=True, help="[lr_v2 only] include the raw dot-product interaction feature")
     parser.add_argument("--v2-standardize-dot", dest="v2_standardize_dot", action=argparse.BooleanOptionalAction, default=True, help="[lr_v2 only] standardize the raw dot-product feature using training-set mean/std")
@@ -89,7 +91,7 @@ def main() -> None:
         None if args.model == "distilbert" else SentenceTransformerEmbedding(model_name=args.embedding_model, device=args.device)
     )
     if args.model == "lr_v1":
-        model = LRRewardModel(embedding_provider=embedding_provider, seed=args.seed, C=args.C, severity_zero_as_positive=args.severity_zero_as_positive)
+        model = LRRewardModel(embedding_provider=embedding_provider, seed=args.seed, C=args.C, severity_zero_as_positive=args.severity_zero_as_positive, ignore_sql_good=args.ignore_sql_good)
     elif args.model == "lr_v2":
         model = LRRewardModelV2(
             embedding_provider=embedding_provider,
@@ -100,20 +102,22 @@ def main() -> None:
             standardize_dot_product=args.v2_standardize_dot,
         )
     elif args.model == "lr_v3":
-        model = LRRewardModelV3(embedding_provider=embedding_provider, seed=args.seed, C=args.C, severity_zero_as_positive=args.severity_zero_as_positive)
+        model = LRRewardModelV3(embedding_provider=embedding_provider, seed=args.seed, C=args.C, severity_zero_as_positive=args.severity_zero_as_positive, ignore_sql_good=args.ignore_sql_good)
     elif args.model == "lr_v4":
-        model = LRRewardModelV4(embedding_provider=embedding_provider, seed=args.seed, C=args.C, severity_zero_as_positive=args.severity_zero_as_positive)
+        model = LRRewardModelV4(embedding_provider=embedding_provider, seed=args.seed, C=args.C, severity_zero_as_positive=args.severity_zero_as_positive, ignore_sql_good=args.ignore_sql_good)
     elif args.model == "lr_v5":
-        model = LRRewardModelV5(embedding_provider=embedding_provider, seed=args.seed, C=args.C, severity_zero_as_positive=args.severity_zero_as_positive)
+        model = LRRewardModelV5(embedding_provider=embedding_provider, seed=args.seed, C=args.C, severity_zero_as_positive=args.severity_zero_as_positive, ignore_sql_good=args.ignore_sql_good)
     elif args.model == "lr_v6":
-        model = LRRewardModelV6(embedding_provider=embedding_provider, seed=args.seed, C=args.C, severity_zero_as_positive=args.severity_zero_as_positive)
+        model = LRRewardModelV6(embedding_provider=embedding_provider, seed=args.seed, C=args.C, severity_zero_as_positive=args.severity_zero_as_positive, ignore_sql_good=args.ignore_sql_good)
     elif args.model == "lr_v7":
         model = LRRewardModelV7(
             embedding_provider=embedding_provider,
             seed=args.seed,
             C=args.C,
             severity_zero_as_positive=args.severity_zero_as_positive,
+            ignore_sql_good=args.ignore_sql_good,
             embedding_diff_mode=args.embedding_diff_mode,
+            include_schema_valid=args.v7_schema_valid,
         )
     elif args.model == "distilbert":
         model = DistilBertRewardModel(
@@ -188,11 +192,18 @@ def main() -> None:
                 **load_stats,  # n_rows_total, n_rows_skipped
                 **({"C": args.C} if args.model in ("lr_v1", "lr_v2", "lr_v3", "lr_v4", "lr_v5", "lr_v6", "lr_v7") else {}),
                 **(
-                    {"severity_zero_as_positive": args.severity_zero_as_positive}
+                    {
+                        "severity_zero_as_positive": args.severity_zero_as_positive,
+                        "ignore_sql_good": args.ignore_sql_good,
+                    }
                     if args.model in ("lr_v1", "lr_v3", "lr_v4", "lr_v5", "lr_v6", "lr_v7")
                     else {}
                 ),
-                **({"embedding_diff_mode": args.embedding_diff_mode} if args.model == "lr_v7" else {}),
+                **(
+                    {"embedding_diff_mode": args.embedding_diff_mode, "v7_schema_valid": args.v7_schema_valid}
+                    if args.model == "lr_v7"
+                    else {}
+                ),
                 **(
                     {
                         "v2_cosine_sim": args.v2_cosine_sim,

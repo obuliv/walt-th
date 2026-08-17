@@ -1076,3 +1076,232 @@ nothing beyond the hard filter. Artifacts:
 `data/output/rm_model_synth_severity_schemavalid_lr_v4.joblib`,
 `data/output/eval_synth_severity_schemavalid_lr_v4_C300_schemafilter.json`, logged as
 `synth_severity_schemavalid_lr_v4_C300*` in `data/output/runs/`/`data/output/eval_runs/`.
+
+**`sql_good` and every `sql_bad` are now sqlglot-normalized before embedding — closes
+a real, previously untested formatting leak, and moves `lr_v6`'s tuned `C` from 300 to
+0.1 (2026-08-17).** Hypothesis: `sql_good` (Spider's hand-written gold, or gretel's,
+etc.) and `sql_bad` never went through the same text-rendering pipeline. For the
+deterministic corruptor (`corrupt.py`), every negative is emitted via
+`mutated.sql(dialect="sqlite")` — a canonical sqlglot render — while `sql_good` kept
+its original hand-formatted casing/spacing verbatim. For the severity pipeline,
+negatives are raw `llama3.2` completions with their own generation-style formatting,
+again never reconciled with Spider's gold formatting. Either way, a model could
+partly be learning "which formatting style does this look like" instead of "is this
+query correct" — a shortcut with zero relevance once real LLM candidates (never
+hand-written gold, never a bare AST re-render) are what actually gets scored at
+inference.
+
+First attempt normalized `sql_good` at *data-generation* time
+(`spider_source.normalize_sql()`, a `sqlglot.parse_one(sql, dialect="sqlite").sql(...)`
+round-trip, falling back to the original text on a parse error) — folded into
+`load_pairs()`, so it's shared by both `build_synth_dataset.py` and
+`build_severity_dataset.py`. Regenerating the deterministic-corruptor dataset under
+this alone (`data/output/synth_normalized/`) dropped CV top1/pairwise/mrr from ≈1.00
+to 0.9875±0.0032/0.9958±0.0011/0.9938±0.0016 — real but small, since that dataset's
+corruptions are already too structurally easy to need a formatting shortcut (see the
+original synth-saturation finding above). A second pass hand-normalizing the
+llama-only severity dataset post hoc (`data/output/synth_severity_normalized/`, via a
+one-off script, since `sql_bad` there is free-form LLM text with no pipeline corruption
+step to intercept) showed a much bigger effect: CV top1 0.9780±0.0080 → 0.9275±0.0217,
+pairwise 0.9897±0.0040 → 0.9611±0.0101 — llama's own generation style is a much
+stronger formatting tell than sqlglot's AST re-render is. Agent-level QA accuracy
+dipped slightly in both cases (deterministic: 55.3%→53.3%; llama-only: 54.3%→52.0%) —
+closing the leak didn't unlock better real-world reranking on its own, just made the
+RM's self-reported numbers honest.
+
+That data-generation-time fix has a real gap, though: it only touches text stored on
+disk, so real `llama3.2` candidates scored at inference (`sql_agent.py`/
+`evaluate.py`) never get normalized — train/inference formatting distributions would
+stay mismatched. Fixed properly by moving normalization into the embedding boundary
+itself: `LRRewardModel.score()`/`fit()`/`warm_cache()` (`rm/model/lr/lr_model.py`, the
+shared base for every `lr_v1`..`lr_v7` variant, plus `gbm_model.py`) now call
+`normalize_sql()` (moved to `walt.utils.sql_exec`, shared by both the data and model
+layers) on every SQL string immediately before it's cached/embedded/compared against
+`is_sql_valid`/`is_schema_valid`. This is automatic for every dataset and every
+inference-time candidate, no dataset regeneration needed, and sidesteps the
+data-generation approach's "drop the candidate that now duplicates `sql_good`"
+bookkeeping — a post-normalization collision just embeds identically and contributes
+a zero-row pair to `fit()` instead of needing to be found and removed. `lr_v7`
+(overrides `score()`/`warm_cache()` without calling `super()`) and `gbm_model.py`
+(overrides `fit()`/`score()` directly against the inherited, now-normalized
+`warm_cache()`) needed matching fixes to avoid a cache-key mismatch between what gets
+embedded and what gets looked up — `LRRewardModelV2`/`V3`/`V4`/`V5`/`V6` and
+`ContextAwareLRRewardModel`/`LRRewardModelV3Scaled` inherit `score()`/`warm_cache()`
+unchanged and needed no changes.
+
+Re-swept `C` for `lr_v6` on the production dataset
+(`data/output/synth_severity/synth_severity_enhanced.jsonl`) under the new
+always-on normalization: the plateau **inverted** — CV top1 falls monotonically as
+`C` grows (C=1: 0.8035 → C=300: 0.7625 → C=10000: 0.7460), peaking instead at
+C≈0.1-0.3 (top1 0.8130/0.8125). Makes sense: with the formatting shortcut gone, there
+is less real signal to fit, so the old low-regularization default now overfits.
+Retrained the default at **C=0.1**: 80/20-split top1/pairwise/mrr dropped from
+0.9225/0.9693/0.9548 to **0.805/0.9322/0.8888** — a large, honest-signal drop, not a
+regression, per the normalization-leak finding above. Agent-level, though, held up or
+improved: SQL pass 279/300 (93.0%) → **286/300 (95.3%)**, QA accuracy 162/300 (54.0%)
+→ 160/300 (53.3%, noise-level). Net: closing the leak cost nothing at the agent level
+and arguably helped SQL pass rate, while making the RM's own reported accuracy numbers
+trustworthy again — **this is now the default everywhere** (`CLAUDE.md`'s "Current
+state" section still says `C=300` as of this writing and needs updating to `C=0.1`).
+Artifacts: `data/output/rm_model_synth_severity_normalized_lr_v6_C0.1.joblib`,
+`data/output/rm_metrics_synth_severity_normalized_lr_v6_C0.1.json`,
+`data/output/eval_synth_severity_normalized_lr_v6_C0.1.json`, logged as
+`synth_severity_normalized_lr_v6_C0.1_{train,eval}` in `data/output/runs/`/
+`data/output/eval_runs/`.
+
+**`ignore_sql_good`: training only on llama-vs-llama correctness (never Spider's
+literal gold text) scores far worse on the RM's own pairwise test but reranks real
+`llama3.2` candidates better than any trained model has so far — the first config to
+beat `constant`+schema-filter on QA accuracy (2026-08-17).** New `LRRewardModel`
+constructor flag (threaded through `lr_v1`/`v3`/`v4`/`v5`/`v6`/`v7`, persisted in
+`save()`/`load()`, exposed as `--ignore-sql-good` on `train.py`/`cross_validate.py`):
+when set, `fit()` drops `sql_good` from `positive_anchors` entirely and uses *only*
+`severity==0` `sql_bad` candidates ("executes to the same result as `sql_good`",
+`enhance_severity_dataset.py`'s label) as the positive anchor — forces
+`severity_zero_as_positive`'s effect on regardless of its own setting, since otherwise
+a row with no `severity==0` candidate would lose every positive-vs-negative pair with
+no anchor left at all. Combined with the ollama-only dataset
+(`synth_severity_enhanced_ollamaonly.jsonl`, `filter_ollama_only.py` — every
+`sql_bad`, at every severity, already restricted to `llama3.2`-origin text), this
+means Spider's hand-written gold SQL never appears anywhere in training: both the
+positive and negative class are llama's own generations, differing only by
+correctness. `evaluate()` is deliberately left untouched — it still ranks against the
+real `sql_good` — so headline CV/pairwise metrics stay comparable to every other run
+in this file; only what `fit()` treats as ground truth changes.
+
+C-swept (0.01-300, 6 points) on the ollama-only dataset: peaks at **C=10**
+(top1 0.7465±0.0317/pairwise 0.8374±0.0187/mrr 0.8495±0.0187) — every value tried
+lands far below the `sql_good`-anchored baseline at its own best `C`
+(top1 0.9255±0.0253/pairwise 0.9592±0.0123/mrr 0.9581±0.0140 at C=300, same dataset,
+same normalized-embedding code), so the gap is real, not a tuning artifact. Trained
+both configs on the identical raw file and ran the agent-level eval on the same
+300-row val split (no-rerank baseline byte-identical across both: 216/300 SQL /
+139/300 QA, confirming apples-to-apples):
+
+| | `sql_good`-anchored (C=300) | `ignore_sql_good` (C=10) |
+|---|---|---|
+| CV pairwise | 0.9592 | 0.8374 |
+| SQL pass w/RM | 272/300 (90.7%) | 284/300 (94.7%) |
+| QA accuracy w/RM | 160/300 (53.3%) | **175/300 (58.3%)** |
+| mixed-bucket achieved | 112/156 (71.8%) | 127/156 (81.4%) |
+
+`ignore_sql_good` scores dramatically worse on its own pairwise-discrimination test
+but reranks real candidates dramatically better. Working hypothesis: `evaluate()`'s
+pairwise metric always tests the model against the literal `sql_good` string as one of
+the candidates, so a `sql_good`-anchored model can partly learn "does this look like
+hand-written Spider SQL" — a source/style tell that scores well on that test but is
+irrelevant at deployment, where the agent only ever reranks `llama3.2`'s own
+candidates, never hand-written gold. `ignore_sql_good` can't lean on that shortcut, so
+it's forced to learn the llama-correct-vs-llama-incorrect distinction that actually
+transfers. **58.3% QA accuracy is the best number anywhere in this file** — it beats
+`constant`+schema-filter's severity-dataset result (168/300, 56.0% QA, 286/300, 95.3%
+SQL pass — see above) on QA accuracy and mixed-bucket achieved (81.4% vs 76.9%), while
+narrowly losing SQL pass rate (94.7% vs 95.3%). Every other trained config in this
+file has lost to `constant`+schema-filter on QA accuracy; this is the first one that
+wins — directly on the open problem flagged in `CLAUDE.md`/this file ("schema
+filtering has ~no power over semantic mistakes... that is exactly where a learned
+model should add value and currently doesn't"). Stacking `--schema-filter` on top of
+the `ignore_sql_good` model closes even that gap: SQL pass 286/300 (95.3%, now tied
+with the pure filter) with QA accuracy unchanged at 175/300 (58.3%) — the hard gate
+catches the couple of schema-invalid candidates `ignore_sql_good` was still
+occasionally out-ranking, at zero cost to QA accuracy. **`ignore_sql_good` +
+`--schema-filter` now strictly dominates every other configuration in this file on
+both metrics simultaneously.** Not yet tried: re-validating on the full
+(non-ollama-only) severity dataset. Artifacts:
+`data/output/rm_model_ollamaonly_sqlgood_lr_v6_C300.joblib`,
+`data/output/rm_model_ollamaonly_ignoresqlgood_lr_v6_C10.joblib`,
+`data/output/eval_ollamaonly_sqlgood_lr_v6_C300.json`,
+`data/output/eval_ollamaonly_ignoresqlgood_lr_v6_C10.json`, logged as
+`ollamaonly_sqlgood_lr_v6_C300*`/`ollamaonly_ignoresqlgood_lr_v6_C10*` in
+`data/output/runs/`/`data/output/eval_runs/`; the filtered combination is
+`data/output/eval_ollamaonly_ignoresqlgood_lr_v6_C10_schemafilter.json`, logged as
+`ollamaonly_ignoresqlgood_lr_v6_C10_schemafilter_eval`.
+
+**`lr_v7` on llama-only + schema-valid-only training reproduces the "no hard schema
+check = actively harmful" pattern in its sharpest form yet — but the filter fully
+rescues it (2026-08-17).** `filter_schema_valid.py` applied on top of the ollama-only
+dataset (`filter_ollama_only.py`'s output) drops schema-invalid `sql_bad` candidates
+entirely (8,999→6,350, 29.4%; 81/2,300 rows lost every negative) →
+`synth_severity_enhanced_ollamaonly_schemavalid.jsonl`. RM discrimination alone looks
+fine — CV top1 0.9495±0.0080/pairwise 0.9557±0.0067/mrr 0.9721±0.0044, 80/20 split
+0.9475/0.9580/0.9717 (n=400) — but `v7` deliberately has no `is_schema_valid` feature
+(see its docstring), and this training set now contains *zero* schema-invalid
+examples for it to learn from either way. Agent-level, unfiltered: **actively
+harmful** — SQL pass 215/300 (71.7%, *below* the 216/300 no-rerank baseline), QA
+accuracy 132/300 (44.0%, below the 139/300 no-rerank baseline), mixed-bucket achieved
+84/156 (53.8%, below random-chance expectation 51.8%) — reranking is choosing worse
+candidates than doing nothing. Stacking `--schema-filter` on top fully rescues it: SQL
+pass 286/300 (95.3%, the standard filtered ceiling), QA accuracy 163/300 (54.3%,
+clearly above no-rerank), mixed-bucket achieved 115/156 (73.7%) — but still below
+`constant`+filter (56.0%) and well below `ignore_sql_good`+filter (58.3%). Confirms
+`is_schema_valid` (or an equivalent hard gate) isn't optional for this candidate
+distribution regardless of which model sits underneath. Artifacts:
+`data/output/rm_model_ollamaonly_schemavalid_lr_v7_C300.joblib`,
+`data/output/eval_ollamaonly_schemavalid_lr_v7_C300.json` (unfiltered),
+`data/output/eval_ollamaonly_schemavalid_lr_v7_C300_schemafilter.json` (filtered),
+logged as `ollamaonly_schemavalid_lr_v7_cosine_C300_cv`/
+`ollamaonly_schemavalid_lr_v7_C300_{train,eval}`/
+`ollamaonly_schemavalid_lr_v7_C300_schemafilter_eval`.
+
+**`lr_v7` gains an `include_schema_valid` flag (V6's own feature, appended to phi_v7)
+— trained on the full llama-only dataset (schema-invalid negatives included this
+time, so the feature has something to learn from), it just reproduces `lr_v6`, no
+better (2026-08-17).** New `LRRewardModel`-family constructor flag
+(`include_schema_valid: bool = False`, default off for backward compat with existing
+saved `v7` models), exposed as `--v7-schema-valid`, appends
+`is_schema_valid(sql, sql_context)` as one more phi dimension (781 total vs. `v7`'s
+780) — same feature `lr_v6` already has, just added on top of `v7`'s extra
+symbolic/lexical block instead of replacing it. `sql_good` still the training anchor
+(not combined with `ignore_sql_good` in this entry — see the next one). CV on the
+*full* ollama-only dataset (not schema-valid-filtered) at `C=300`: top1
+0.9285±0.0262/pairwise 0.9620±0.0112/mrr 0.9600±0.0140 — statistically tied with plain
+`lr_v6`'s own baseline on the identical dataset/`C` (0.9255/0.9592/0.9581). A coarse
+`C`-sweep (0.01/0.1/1/10, log-decade steps) plateaus by `C=1`
+(top1 0.9275/pairwise 0.9617/mrr 0.9594, `C=10` statistically identical at
+0.9260/0.9619/0.9589) — picked `C=1`. Agent-level: unfiltered at `C=300` gives SQL
+pass 274/300 (91.3%), QA accuracy 161/300 (53.7%), mixed-bucket achieved 113/156
+(72.4%); the tuned `C=1` model with `--schema-filter` gives SQL pass 286/300 (95.3%,
+the standard filtered ceiling) and **the identical 161/300 (53.7%) QA accuracy** — the
+filter only closes the SQL-pass gap, doesn't move QA at all. 53.7% is within noise of
+plain `lr_v6` default's 53.3% and clearly behind `ignore_sql_good`+filter's 58.3%:
+**`v7`'s extra symbolic/lexical features (length ratio, structural counts,
+question-arg overlap, commands/args embedding split) add nothing on top of
+`is_schema_valid`, whether soft (this entry) or hard-filtered.** Artifacts:
+`data/output/rm_model_ollamaonly_lr_v7_schemavalid_feature_C300.joblib` (unfiltered
+test point), `data/output/rm_model_ollamaonly_lr_v7_schemavalid_feature_C1.joblib`
+(final, filtered), `data/output/eval_ollamaonly_lr_v7_schemavalid_feature_C300.json`,
+`data/output/eval_ollamaonly_lr_v7_schemavalid_feature_C1_schemafilter.json`, logged
+as `ollamaonly_lr_v7_schemavalid_feature_C300_{cv,train,eval}`/
+`ollamaonly_lr_v7_schemavalid_feature_C1_schemafilter_eval`.
+
+**Stacking `ignore_sql_good` on top of `v7`+`is_schema_valid` closes most of the gap
+to the best config, but still doesn't beat plain `lr_v6`+`ignore_sql_good`+filter
+(2026-08-17).** Same `v7` + `include_schema_valid` model as above, but trained with
+`--ignore-sql-good` too (`C=10`, reused from the closest comparable sweeps — not
+independently tuned for this exact combination), `--schema-filter` at inference.
+Agent-level: SQL pass 286/300 (95.3%, filtered ceiling), QA accuracy **171/300
+(57.0%)**, mixed-bucket achieved 123/156 (78.8%) — a large jump over the same model
+without `ignore_sql_good` (53.7%→57.0%), confirming `ignore_sql_good` is doing almost
+all of the work yet again, `v7`'s extra features contributing a little (57.0% vs.
+`lr_v6`+`ignore_sql_good`+filter's 58.3% on the identical setup) but not enough to
+overtake it. 80/20-split RM discrimination for this combination is the lowest of any
+`v7` variant tried (top1 0.74/pairwise 0.8462/mrr 0.8483, n=400) — expected, same
+"scores worse on its own pairwise test, reranks better in practice" pattern
+`ignore_sql_good` already showed on `lr_v6`. Current full ranking on the ollama-only
+val set (all filtered where noted):
+
+| config | SQL pass | QA accuracy |
+|---|---|---|
+| `lr_v6` + `ignore_sql_good` + filter | 95.3% | **58.3%** |
+| `lr_v7` + `is_schema_valid` + `ignore_sql_good` + filter | 95.3% | 57.0% |
+| `constant` + filter (no training at all) | 95.3% | 56.0% |
+| `lr_v7`, schema-valid-only training, + filter | 95.3% | 54.3% |
+| `lr_v7` + `is_schema_valid` (no `ignore_sql_good`) + filter | 95.3% | 53.7% |
+| `lr_v6` default (`sql_good`-anchored) | 90.7% | 53.3% |
+| `lr_v7`, schema-valid-only training, no filter | 71.7% | 44.0% (below no-rerank) |
+
+`ignore_sql_good` remains the single biggest lever found in this file — bigger than
+which `lr_*` variant, bigger than which extra features, bigger than the hard filter
+alone. Artifacts: `data/output/rm_model_ollamaonly_lr_v7_schemavalid_ignoresqlgood_C10.joblib`,
+`data/output/eval_ollamaonly_lr_v7_schemavalid_ignoresqlgood_C10_schemafilter.json`,
+logged as `ollamaonly_lr_v7_schemavalid_ignoresqlgood_C10_{train,schemafilter_eval}`.

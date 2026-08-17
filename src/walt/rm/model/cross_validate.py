@@ -49,7 +49,9 @@ def main() -> None:
     parser.add_argument("--penalty", choices=sorted(SOLVER_BY_PENALTY), default="l2", help="[lr_v1/lr_v2/lr_v3/lr_v3_scaled only] LogisticRegression penalty type")
     parser.add_argument("--l1-ratio", type=float, default=None, help="[penalty=elasticnet only] elastic-net mixing parameter in [0,1] (0=l2, 1=l1)")
     parser.add_argument("--severity-zero-as-positive", action="store_true", help="[lr_v1/lr_v3/lr_v4/lr_v5/lr_v6/lr_v7 only] treat severity==0 sql_bad candidates (from enhance_severity_dataset.py) as extra positive anchors paired against every real bad, instead of excluding them from every pair. No-op on datasets without severity — compare against the default (off) to A/B this.")
+    parser.add_argument("--ignore-sql-good", action="store_true", help="[lr_v1/lr_v3/lr_v4/lr_v5/lr_v6/lr_v7 only] drop sql_good from positive_anchors entirely and use ONLY severity==0 sql_bad candidates as the positive anchor. evaluate() is unchanged — still ranks against the real sql_good.")
     parser.add_argument("--embedding-diff-mode", choices=EMBEDDING_DIFF_MODES, default="cosine", help="[lr_v7 only] how the commands/args-vs-question embedding comparison is folded into phi: 'cosine' (2 scalar cosine similarities) or 'raw' (2x768 raw vector differences)")
+    parser.add_argument("--v7-schema-valid", dest="v7_schema_valid", action="store_true", help="[lr_v7 only] append is_schema_valid(sql, sql_context) to phi_v7 (V7 excludes it by default, unlike lr_v6)")
     parser.add_argument("--v2-cosine-sim", dest="v2_cosine_sim", action=argparse.BooleanOptionalAction, default=True, help="[lr_v2 only]")
     parser.add_argument("--v2-dot-product", dest="v2_dot_product", action=argparse.BooleanOptionalAction, default=True, help="[lr_v2 only]")
     parser.add_argument("--v2-standardize-dot", dest="v2_standardize_dot", action=argparse.BooleanOptionalAction, default=True, help="[lr_v2 only]")
@@ -85,6 +87,7 @@ def main() -> None:
             return LRRewardModel(
                 embedding_provider=embedding_provider, seed=args.seed, C=args.C, penalty=args.penalty,
                 l1_ratio=args.l1_ratio, severity_zero_as_positive=args.severity_zero_as_positive,
+                ignore_sql_good=args.ignore_sql_good,
             )
         if args.model == "lr_v2":
             return LRRewardModelV2(
@@ -101,27 +104,33 @@ def main() -> None:
             return LRRewardModelV3(
                 embedding_provider=embedding_provider, seed=args.seed, C=args.C, penalty=args.penalty,
                 l1_ratio=args.l1_ratio, severity_zero_as_positive=args.severity_zero_as_positive,
+                ignore_sql_good=args.ignore_sql_good,
             )
         if args.model == "lr_v4":
             return LRRewardModelV4(
                 embedding_provider=embedding_provider, seed=args.seed, C=args.C, penalty=args.penalty,
                 l1_ratio=args.l1_ratio, severity_zero_as_positive=args.severity_zero_as_positive,
+                ignore_sql_good=args.ignore_sql_good,
             )
         if args.model == "lr_v5":
             return LRRewardModelV5(
                 embedding_provider=embedding_provider, seed=args.seed, C=args.C, penalty=args.penalty,
                 l1_ratio=args.l1_ratio, severity_zero_as_positive=args.severity_zero_as_positive,
+                ignore_sql_good=args.ignore_sql_good,
             )
         if args.model == "lr_v6":
             return LRRewardModelV6(
                 embedding_provider=embedding_provider, seed=args.seed, C=args.C, penalty=args.penalty,
                 l1_ratio=args.l1_ratio, severity_zero_as_positive=args.severity_zero_as_positive,
+                ignore_sql_good=args.ignore_sql_good,
             )
         if args.model == "lr_v7":
             return LRRewardModelV7(
                 embedding_provider=embedding_provider, seed=args.seed, C=args.C, penalty=args.penalty,
                 l1_ratio=args.l1_ratio, severity_zero_as_positive=args.severity_zero_as_positive,
+                ignore_sql_good=args.ignore_sql_good,
                 embedding_diff_mode=args.embedding_diff_mode,
+                include_schema_valid=args.v7_schema_valid,
             )
         if args.model == "lr_v3_scaled":
             return LRRewardModelV3Scaled(
@@ -164,7 +173,10 @@ def main() -> None:
                 "penalty": args.penalty,
                 "l1_ratio": args.l1_ratio,
                 **(
-                    {"severity_zero_as_positive": args.severity_zero_as_positive}
+                    {
+                        "severity_zero_as_positive": args.severity_zero_as_positive,
+                        "ignore_sql_good": args.ignore_sql_good,
+                    }
                     if args.model in ("lr_v1", "lr_v3", "lr_v4", "lr_v5", "lr_v6", "lr_v7")
                     else {}
                 ),
@@ -174,7 +186,11 @@ def main() -> None:
                     else {}
                 ),
                 **({"scaling": args.scaling} if args.model == "lr_v3_scaled" else {}),
-                **({"embedding_diff_mode": args.embedding_diff_mode} if args.model == "lr_v7" else {}),
+                **(
+                    {"embedding_diff_mode": args.embedding_diff_mode, "v7_schema_valid": args.v7_schema_valid}
+                    if args.model == "lr_v7"
+                    else {}
+                ),
                 **(
                     {"gbm_max_iter": args.gbm_max_iter, "gbm_max_depth": args.gbm_max_depth, "gbm_learning_rate": args.gbm_learning_rate}
                     if args.model == "gbm"

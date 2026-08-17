@@ -205,7 +205,17 @@ sklearn `LogisticRegression` on `phi(q,A) - phi(q,B)` for candidate pairs (Bradl
 style — a per-candidate scorer, so it generalizes to any-size candidate lists).
 Embeddings come from a swappable `EmbeddingProvider` (`embeddings.py`); the default is
 `jinaai/jina-embeddings-v2-base-code` (needs `trust_remote_code=True` + `einops`).
-`penalty`/`l1_ratio` are supported via `SOLVER_BY_PENALTY`.
+`penalty`/`l1_ratio` are supported via `SOLVER_BY_PENALTY`. Every SQL string is run
+through `walt.utils.sql_exec.normalize_sql` (a sqlglot parse/print round-trip,
+falls back to the original text on a parse error) immediately before it's
+cached/embedded — in `score()`, `fit()`, and `warm_cache()`, so training pairs and
+real inference-time candidates are normalized identically. This closes a formatting
+leak: `sql_good` and `sql_bad` never otherwise shared a text-rendering convention
+(hand-written/gretel-shipped gold vs. sqlglot-rendered corruptions or `llama3.2`'s own
+generation style), so a model could partly learn "which style is this" instead of "is
+this correct." `lr_v7` and `gbm_model.py` override `score()`/`fit()` directly and
+replicate this normalization to stay consistent with the inherited `warm_cache()`;
+every other LR variant inherits `score()`/`warm_cache()` unchanged.
 
 Variants (all under `lr/`, re-exported by `walt.rm.model.lr`):
 
@@ -236,6 +246,17 @@ consumption as before the field existed); `severity == 0` bads are excluded enti
 `1..5` bads additionally pair against every other `1..5` bad of *different* severity.
 `evaluate()` mirrors this (severity=0 excluded from ranking and pairwise accuracy).
 `--severity-zero-as-positive` is a tested-and-rejected opt-in ablation — keep it off.
+`--ignore-sql-good` is the opposite bet and currently looks like a win: it drops
+`sql_good` from `positive_anchors` entirely and uses *only* `severity==0` bads as the
+positive anchor (forcing `severity_zero_as_positive`'s effect on regardless of its own
+setting), so training never sees Spider's literal gold text — only `llama3.2`'s own
+correct-vs-incorrect distinction. Scores far worse on the RM's own pairwise test but
+reranks real `llama3.2` candidates better than any trained model tried so far — see
+`docs/experiments.md` and "Current state" below. `evaluate()` is unchanged by this
+flag (still ranks against the real `sql_good`), so it isn't directly comparable
+against `--severity-zero-as-positive`'s or the default's CV numbers as "the same test,
+different training" — it's measuring transfer to a held-out ground truth the model
+never trained on.
 
 `tracking.py` (`log_run`/`load_runs`) is shared, algorithm-agnostic run logging, reused
 unchanged by `eval/evaluate.py` against its own `data/output/eval_runs/`.
@@ -288,23 +309,34 @@ expectation).
 
 ## Current state (details in [`docs/experiments.md`](docs/experiments.md))
 
-- **Default config**: `lr_v6` (`lr_v3` phi + `is_schema_valid`) at `C=300`, on the
-  severity-scored synth dataset. `C` is tuned per dataset — re-sweep it, don't inherit.
-- **Best RM numbers**: severity-scored synth, `lr_v6`/`C=300` — top1 0.9225 / pairwise
-  0.9693 / mrr 0.9548. gretel is much harder (~0.55-0.60 top1); the deterministic-corruptor
-  synth set saturates at ~1.00 (corruptions are too surface-distinguishable to be a real
-  measure).
-- **`is_schema_valid` is the whole agent-level story.** On the synth val sets, the ladder
-  is: no reranking 72.0% SQL pass / 46.3% QA → `lr_v3` (no schema signal) 70.3% / 45.0%
-  (*worse than not reranking*) → `lr_v6` 93.0% / 54.0% → `constant` + `--schema-filter`
-  (zero training, just reject schema-invalid candidates) 95.3% / **56.0%, the best of
-  every configuration tested**. The learned embedding signal currently costs a couple of
-  points rather than adding any.
+- **Default config**: `lr_v6` (`lr_v3` phi + `is_schema_valid`) at `C=0.1`, on the
+  severity-scored synth dataset. `C` dropped from 300 once every SQL string started
+  getting sqlglot-normalized before embedding (see above) — that closed a formatting
+  leak, and the old high-`C` (low-regularization) default started overfitting once it
+  was gone. `C` is tuned per dataset/config — re-sweep it, don't inherit.
+- **Best RM numbers** (honest, post-normalization): severity-scored synth, `lr_v6`/`C=0.1`
+  — top1 0.805 / pairwise 0.9322 / mrr 0.8888 on the standard 80/20 split. (Was
+  0.9225/0.9693/0.9548 at the old `C=300` before normalization — that drop is the leak
+  closing, not a regression; agent-level performance held up, see below.) gretel is
+  still much harder (~0.55-0.60 top1); the deterministic-corruptor synth set still
+  saturates, now at ~0.99 instead of ~1.00.
+- **`is_schema_valid` is still most of the agent-level story, but no longer all of
+  it.** On the severity-scored synth val set: no reranking 72.0% SQL pass / 46.3% QA →
+  `lr_v3` (no schema signal) 70.3% / 45.0% (*worse than not reranking*) → `lr_v6`
+  95.3% / 53.3% → `constant` + `--schema-filter` (zero training, just reject
+  schema-invalid candidates) 95.3% / 56.0% → **`lr_v6` trained with
+  `--ignore-sql-good`** (drops `sql_good` as the training anchor entirely, trains only
+  on `llama3.2`'s own correct-vs-incorrect distinction) **+ `--schema-filter`**
+  stacked on top: 95.3% / **58.3%, the best of every configuration tested, on both
+  metrics simultaneously** — `--ignore-sql-good` alone gets the QA win but narrowly
+  loses SQL pass (94.7%) to the filter baseline; stacking the hard filter on top closes
+  that gap for free (same 58.3% QA, now tied at 95.3% SQL pass too).
 - **The RM does not transfer to `llama3.2`'s candidate distribution without that hard
   schema check** — reranking was tied on spider/dbasql and actively harmful on
   gretel/gretel_opus. Schema awareness only pays off as a hard, execution-verified fact:
   soft embedding proximity to the schema (`lr_v4`) is a null-to-negative result, because a
   hallucinated column still sits close to the real schema in embedding space.
-- **Open gap**: schema filtering has ~no power over semantic mistakes (both sides of the
-  pair are schema-valid). That is exactly where a learned model should add value and
-  currently doesn't — the main open problem in this repo.
+- **Open gap, mostly closed**: schema filtering used to have ~no power over semantic
+  mistakes and no trained model beat it on QA accuracy — `--ignore-sql-good` +
+  `--schema-filter` (above) now strictly dominates it. Not yet validated beyond the
+  ollama-only dataset (full severity-scored dataset, gretel, spider/dbasql).

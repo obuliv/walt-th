@@ -24,6 +24,7 @@ from sklearn.linear_model import LogisticRegression
 from walt.rm.data.base import Example
 from walt.rm.model.base import BaseRewardModel
 from walt.rm.model.embeddings import EmbeddingProvider, build_provider_from_config
+from walt.utils.sql_exec import normalize_sql
 
 
 SOLVER_BY_PENALTY = {"l2": "lbfgs", "l1": "liblinear", "elasticnet": "saga"}
@@ -38,6 +39,7 @@ class LRRewardModel(BaseRewardModel):
         penalty: str = "l2",
         l1_ratio: Optional[float] = None,
         severity_zero_as_positive: bool = False,
+        ignore_sql_good: bool = False,
     ):
         if penalty not in SOLVER_BY_PENALTY:
             raise ValueError(f"penalty must be one of {sorted(SOLVER_BY_PENALTY)}, got {penalty!r}")
@@ -57,6 +59,19 @@ class LRRewardModel(BaseRewardModel):
         # less-trustworthy label than sql_good itself, which is what makes this an
         # ablation to compare rather than an obvious default.
         self.severity_zero_as_positive = severity_zero_as_positive
+        # Ablation flag (default off): when True, fit() drops sql_good from
+        # positive_anchors entirely and uses ONLY severity==0 sql_bad candidates as the
+        # positive anchor (forces severity_zero_as_positive's effect on regardless of
+        # its own setting — otherwise a row with no severity==0 candidate would silently
+        # lose every good-vs-bad pair with no positive anchor left at all). The point:
+        # train the model to distinguish "correct" from "incorrect" using ONLY
+        # candidates drawn from the same generator (e.g. llama3.2), so the positive and
+        # negative classes never differ by *source* (hand-written gold vs LLM output),
+        # only by correctness — removes a distributional confound normalize_sql() can't
+        # touch. evaluate() is deliberately left alone (still ranks against the real
+        # ex.sql_good) so headline metrics stay comparable across every other run in
+        # this file — this only changes what fit() treats as ground truth.
+        self.ignore_sql_good = ignore_sql_good
         self.coef_: Optional[np.ndarray] = None  # shape (dim + 1,)
         self._question_cache: dict[str, np.ndarray] = {}
         self._sql_cache: dict[str, np.ndarray] = {}
@@ -83,9 +98,17 @@ class LRRewardModel(BaseRewardModel):
         Deliberately embeds every sql_bad candidate directly (not via all_candidates(),
         which excludes severity==0 — correct for evaluate()'s ranking, but fit() with
         severity_zero_as_positive=True needs those embeddings too). A cached-but-unused
-        embedding is free; a missing one is a hard KeyError in _phi()."""
+        embedding is free; a missing one is a hard KeyError in _phi().
+
+        SQL strings are normalize_sql()'d before caching — see score()'s docstring for
+        why. Two sql_bad candidates (or a candidate and sql_good) that only differ in
+        formatting collapse to the same cache entry here, which is fine: _phi() then
+        sees identical vectors for both, so that pair contributes a zero row to fit()
+        instead of needing to be dropped upstream."""
         questions = [ex.question for ex in examples]
-        sqls = [ex.sql_good for ex in examples] + [b.sql for ex in examples for b in ex.sql_bad]
+        sqls = [normalize_sql(ex.sql_good) for ex in examples] + [
+            normalize_sql(b.sql) for ex in examples for b in ex.sql_bad
+        ]
         self._embed_unique(questions, self._question_cache)
         self._embed_unique(sqls, self._sql_cache)
 
@@ -124,22 +147,22 @@ class LRRewardModel(BaseRewardModel):
             # anchor, paired against every none/ranked bad the same way sql_good is.
             # Zero-severity candidates are never paired against sql_good or each other
             # (both sides tied at the same correctness rank — no signal either way).
-            positive_anchors = [ex.sql_good]
-            if self.severity_zero_as_positive:
-                positive_anchors += [b.sql for b in ex.sql_bad if b.severity == 0]
+            positive_anchors = [] if self.ignore_sql_good else [normalize_sql(ex.sql_good)]
+            if self.severity_zero_as_positive or self.ignore_sql_good:
+                positive_anchors += [normalize_sql(b.sql) for b in ex.sql_bad if b.severity == 0]
 
             pairs: list[tuple[str, str]] = []  # (better_sql, worse_sql)
             for anchor in positive_anchors:
                 for b in none_bads:
-                    pairs.append((anchor, b.sql))
+                    pairs.append((anchor, normalize_sql(b.sql)))
                 for b in ranked_bads:
-                    pairs.append((anchor, b.sql))
+                    pairs.append((anchor, normalize_sql(b.sql)))
             for i, b1 in enumerate(ranked_bads):
                 for b2 in ranked_bads[i + 1 :]:
                     if b1.severity == b2.severity:
                         continue
                     better, worse = (b1, b2) if b1.severity < b2.severity else (b2, b1)
-                    pairs.append((better.sql, worse.sql))
+                    pairs.append((normalize_sql(better.sql), normalize_sql(worse.sql)))
 
             for better_sql, worse_sql in pairs:
                 if rng.random() < 0.5:
@@ -187,13 +210,20 @@ class LRRewardModel(BaseRewardModel):
             "lr_converged": n_iter < max_iter,
             "lr_n_zero_coefs": n_zero_coefs,  # implicit feature selection under L1/elasticnet; always 0 under L2
             "severity_zero_as_positive": self.severity_zero_as_positive,
+            "ignore_sql_good": self.ignore_sql_good,
             "embed_seconds": round(embed_seconds, 3),
             "fit_seconds": round(fit_seconds, 3),
         }
 
     def score(self, question: str, sql: str, sql_context: tuple[str, ...] = ()) -> float:
+        """sql is normalize_sql()'d before embedding — training pairs are built the
+        same way (see fit()/warm_cache()), so a real LLM candidate's raw formatting
+        (keyword casing, spacing) never becomes a signal the model can key off that
+        wasn't actually there at training time. Falls back to score-time normalization
+        if this candidate's normalized text wasn't already warmed into the cache."""
         if self.coef_ is None:
             raise RuntimeError("LRRewardModel.score() called before fit()/load()")
+        sql = normalize_sql(sql)
         self._embed_unique([question], self._question_cache)
         self._embed_unique([sql], self._sql_cache)
         phi = self._phi(question, sql, sql_context)
@@ -207,6 +237,7 @@ class LRRewardModel(BaseRewardModel):
             "penalty": self.penalty,
             "l1_ratio": self.l1_ratio,
             "severity_zero_as_positive": self.severity_zero_as_positive,
+            "ignore_sql_good": self.ignore_sql_good,
             "embedding_config": self.embedding_provider.config,
         }
         joblib.dump(payload, path)
@@ -222,6 +253,7 @@ class LRRewardModel(BaseRewardModel):
             penalty=payload.get("penalty", "l2"),
             l1_ratio=payload.get("l1_ratio"),
             severity_zero_as_positive=payload.get("severity_zero_as_positive", False),
+            ignore_sql_good=payload.get("ignore_sql_good", False),
         )
         model.coef_ = payload["coef"]
         return model
