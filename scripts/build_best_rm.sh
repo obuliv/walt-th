@@ -8,7 +8,8 @@
 #      reason + 0-5 severity to every candidate. (Pauses for confirmation before
 #      submitting -- this is a real, billed Anthropic Message Batch.)
 #   3. filter_ollama_only.py  -- keep only llama3.2-origin sql_bad.
-#   4. cross_validate.py --model lr_v6 --ignore-sql-good, swept over C.
+#   4. cross_validate.py --model lr_v6 --ignore-sql-good --drop-bad-vs-bad-pairs,
+#      swept over C.
 #   5. train.py with the best C from the sweep.
 #
 # Requires: a local Ollama server with llama3.2 pulled, and ANTHROPIC_API_KEY set.
@@ -79,12 +80,12 @@ uv run python -m walt.rm.data.synth.enhance_severity_dataset collect --batch-id 
 echo "== [3/5] filter_ollama_only.py =="
 uv run python -m walt.rm.data.filter_ollama_only --stage1 "$STAGE1" --input "$ENHANCED" --output "$OLLAMAONLY"
 
-# ---- 4. sweep C for lr_v6 --ignore-sql-good ---------------------------------
-echo "== [4/5] cross_validate.py C-sweep (lr_v6, --ignore-sql-good) over: $C_SWEEP =="
+# ---- 4. sweep C for lr_v6 --ignore-sql-good --drop-bad-vs-bad-pairs --------
+echo "== [4/5] cross_validate.py C-sweep (lr_v6, --ignore-sql-good --drop-bad-vs-bad-pairs) over: $C_SWEEP =="
 for c in $C_SWEEP; do
   echo "-- C=$c --"
   uv run python -m walt.rm.model.cross_validate \
-    --model lr_v6 --ignore-sql-good --C "$c" \
+    --model lr_v6 --ignore-sql-good --drop-bad-vs-bad-pairs --C "$c" \
     --input "$OLLAMAONLY" --run-name "sweep_C${c}" --runs-dir "$RUNS_DIR"
 done
 
@@ -106,9 +107,9 @@ PY
 echo "Selected $best_c"
 
 # ---- 5. final train with the swept C ----------------------------------------
-echo "== [5/5] train.py (lr_v6, --ignore-sql-good, C=$best_c) =="
+echo "== [5/5] train.py (lr_v6, --ignore-sql-good --drop-bad-vs-bad-pairs, C=$best_c) =="
 uv run python -m walt.rm.model.train \
-  --model lr_v6 --ignore-sql-good --C "$best_c" \
+  --model lr_v6 --ignore-sql-good --drop-bad-vs-bad-pairs --C "$best_c" \
   --input "$OLLAMAONLY" \
   --model-output "$MODEL_OUTPUT" \
   --metrics-output "$METRICS_OUTPUT" \

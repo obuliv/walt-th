@@ -1,16 +1,16 @@
 {
   "n_examples": 400,
   "n_pairs": 1099,
-  "top1_accuracy": 0.74,
-  "pairwise_accuracy": 0.8535031847133758,
-  "mrr": 0.8507499999999998,
+  "top1_accuracy": 0.78,
+  "pairwise_accuracy": 0.8689717925386715,
+  "mrr": 0.871958333333333,
   "pairwise_accuracy_by_reason": {
-    "compound": 0.9457831325301205,
+    "compound": 0.927710843373494,
     "llama": 0.8538461538461538,
-    "misjoined_tables": 0.8960176991150443,
-    "missing_filters": 0.71875,
-    "unsafe_patterns": 0.7876106194690266,
-    "wrong_aggregation": 0.7535211267605634
+    "misjoined_tables": 0.922566371681416,
+    "missing_filters": 0.6979166666666666,
+    "unsafe_patterns": 0.831858407079646,
+    "wrong_aggregation": 0.7887323943661971
   },
   "n_pairs_by_reason": {
     "compound": 166,

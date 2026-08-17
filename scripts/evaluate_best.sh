@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Agent-level evaluation of the model scripts/build_best_rm.sh trained: lr_v6,
-# --ignore-sql-good on the ollama-only severity dataset, stacked with a hard
-# --schema-filter on top -- the config docs/experiments.md reports as the best
-# found (95.3% SQL pass / 58.3% QA accuracy on the ollama-only val split).
+# --ignore-sql-good --drop-bad-vs-bad-pairs on the ollama-only severity dataset,
+# stacked with a hard --schema-filter on top -- the config docs/experiments.md
+# reports as the best found (95.3% SQL pass / 59.0% QA accuracy on the
+# ollama-only val split).
 #
 # Also runs the constant+schema-filter baseline (zero training, just the hard
 # filter) on the same val rows, so the printed funnel shows what the trained

@@ -65,18 +65,56 @@ class _Pair(NamedTuple):
     reason: str
 
 
-def build_pairs(examples: list[Example], seed: int) -> list[_Pair]:
+def build_pairs(
+    examples: list[Example],
+    seed: int,
+    ignore_sql_good: bool = False,
+    severity_zero_as_positive: bool = False,
+    drop_bad_vs_bad_pairs: bool = False,
+) -> list[_Pair]:
     """Same anti-positional-bias pattern as LRRewardModel.fit: one RNG, created once,
-    consumed sequentially per (example, sql_bad) in iteration order."""
+    consumed sequentially per (example, pair) in iteration order.
+
+    Pairing rule mirrors LRRewardModel.fit()'s effective-rank rule exactly (see
+    CLAUDE.md / lr_model.py): with every flag at its default (False), this reduces to
+    the original sql_good-vs-every-bad pairing, in the same order, consuming the same
+    number of rng draws per example — a dataset with severity always None (or these
+    flags never passed) produces bit-identical output to before these flags existed.
+    With severity populated: severity==None bads pair only against positive_anchors
+    (sql_good, plus severity==0 bads when severity_zero_as_positive or
+    ignore_sql_good); severity==0 bads are excluded from every pair otherwise (no
+    signal in a tied pair); ignore_sql_good drops sql_good from positive_anchors
+    entirely; severity in 1..5 bads additionally pair against each other whenever
+    their severity differs, unless drop_bad_vs_bad_pairs is set."""
     rng = random.Random(seed)
     pairs: list[_Pair] = []
     for ex in examples:
-        for bad in ex.sql_bad:
+        none_bads = [b for b in ex.sql_bad if b.severity is None]
+        ranked_bads = [b for b in ex.sql_bad if b.severity is not None and b.severity > 0]
+        positive_anchors = [] if ignore_sql_good else [ex.sql_good]
+        if severity_zero_as_positive or ignore_sql_good:
+            positive_anchors += [b.sql for b in ex.sql_bad if b.severity == 0]
+
+        ex_pairs: list[tuple[str, str, str]] = []  # (better_sql, worse_sql, reason)
+        for anchor in positive_anchors:
+            for b in none_bads:
+                ex_pairs.append((anchor, b.sql, b.reason))
+            for b in ranked_bads:
+                ex_pairs.append((anchor, b.sql, b.reason))
+        if not drop_bad_vs_bad_pairs:
+            for i, b1 in enumerate(ranked_bads):
+                for b2 in ranked_bads[i + 1 :]:
+                    if b1.severity == b2.severity:
+                        continue
+                    better, worse = (b1, b2) if b1.severity < b2.severity else (b2, b1)
+                    ex_pairs.append((better.sql, worse.sql, worse.reason))
+
+        for better_sql, worse_sql, reason in ex_pairs:
             if rng.random() < 0.5:
-                sql_a, sql_b, label = ex.sql_good, bad.sql, 1.0
+                sql_a, sql_b, label = better_sql, worse_sql, 1.0
             else:
-                sql_a, sql_b, label = bad.sql, ex.sql_good, 0.0
-            pairs.append(_Pair(ex.question, ex.sql_context_clean, sql_a, sql_b, label, bad.reason))
+                sql_a, sql_b, label = worse_sql, better_sql, 0.0
+            pairs.append(_Pair(ex.question, ex.sql_context_clean, sql_a, sql_b, label, reason))
     return pairs
 
 
@@ -140,6 +178,9 @@ class DistilBertRewardModel(BaseRewardModel):
         early_stop_patience: int = 3,
         early_stop_metric: str = "pairwise_accuracy",  # "pairwise_accuracy" (higher better) | "loss" (lower better)
         eval_batch_size: int = 32,
+        ignore_sql_good: bool = False,
+        severity_zero_as_positive: bool = False,
+        drop_bad_vs_bad_pairs: bool = False,
     ):
         if early_stop_metric not in ("pairwise_accuracy", "loss"):
             raise ValueError(f"early_stop_metric must be 'pairwise_accuracy' or 'loss', got {early_stop_metric!r}")
@@ -157,6 +198,11 @@ class DistilBertRewardModel(BaseRewardModel):
         self.early_stop_patience = early_stop_patience
         self.early_stop_metric = early_stop_metric
         self.eval_batch_size = eval_batch_size
+        # See build_pairs() docstring / LRRewardModel.fit() for the exact pairing rule
+        # these three flags control (identical semantics/CLI flags to the lr_* family).
+        self.ignore_sql_good = ignore_sql_good
+        self.severity_zero_as_positive = severity_zero_as_positive
+        self.drop_bad_vs_bad_pairs = drop_bad_vs_bad_pairs
 
         torch.manual_seed(seed)
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -227,8 +273,13 @@ class DistilBertRewardModel(BaseRewardModel):
         self._score_cache = {}
 
         internal_train, internal_val = group_split(train_examples, test_size=self.val_fraction, seed=self.seed + 1)
-        train_pairs = build_pairs(internal_train, seed=self.seed)
-        val_pairs = build_pairs(internal_val, seed=self.seed)
+        pair_kwargs = dict(
+            ignore_sql_good=self.ignore_sql_good,
+            severity_zero_as_positive=self.severity_zero_as_positive,
+            drop_bad_vs_bad_pairs=self.drop_bad_vs_bad_pairs,
+        )
+        train_pairs = build_pairs(internal_train, seed=self.seed, **pair_kwargs)
+        val_pairs = build_pairs(internal_val, seed=self.seed, **pair_kwargs)
         train_pre = self._pretokenize(train_pairs)
         val_pre = self._pretokenize(val_pairs)
 
@@ -328,6 +379,9 @@ class DistilBertRewardModel(BaseRewardModel):
             "n_train_pairs": len(train_pairs),
             "n_val_pairs": len(val_pairs),
             "label_balance": {"a_is_good": n_pos, "b_is_good": len(train_pairs) - n_pos},
+            "ignore_sql_good": self.ignore_sql_good,
+            "severity_zero_as_positive": self.severity_zero_as_positive,
+            "drop_bad_vs_bad_pairs": self.drop_bad_vs_bad_pairs,
             "learning_rate": self.learning_rate,
             "weight_decay": self.weight_decay,
             "batch_size": self.batch_size,
@@ -367,6 +421,9 @@ class DistilBertRewardModel(BaseRewardModel):
                 "early_stop_patience": self.early_stop_patience,
                 "early_stop_metric": self.early_stop_metric,
                 "eval_batch_size": self.eval_batch_size,
+                "ignore_sql_good": self.ignore_sql_good,
+                "severity_zero_as_positive": self.severity_zero_as_positive,
+                "drop_bad_vs_bad_pairs": self.drop_bad_vs_bad_pairs,
             },
         }
         torch.save(payload, path)
