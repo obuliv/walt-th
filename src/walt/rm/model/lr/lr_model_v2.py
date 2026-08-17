@@ -40,7 +40,7 @@ import numpy as np
 from walt.rm.data.base import Example
 from walt.rm.model.base import all_candidates
 from walt.rm.model.embeddings import EmbeddingProvider, build_provider_from_config
-from walt.rm.model.lr_model import LRRewardModel
+from walt.rm.model.lr.lr_model import LRRewardModel
 
 
 class LRRewardModelV2(LRRewardModel):

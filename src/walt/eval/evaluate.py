@@ -24,22 +24,79 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
+import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from walt.agent.sql_agent import SqlAgent, build_llm
 from walt.rm.data.base import Example
 from walt.rm.model.base import load_examples
+from walt.rm.model.constant_model import ConstantRewardModel
+from walt.rm.model.distilbert_model import DistilBertRewardModel
 from walt.rm.model.embeddings import SentenceTransformerEmbedding
-from walt.rm.model.lr_model_v3 import LRRewardModelV3
+from walt.rm.model.lr.lr_model_v3 import LRRewardModelV3
+from walt.rm.model.lr.lr_model_v4 import LRRewardModelV4
+from walt.rm.model.lr.lr_model_v6 import LRRewardModelV6
+from walt.rm.model.lr.lr_model_v7 import LRRewardModelV7
+from walt.rm.model.schema_filter import SchemaFilteredRewardModel
 from walt.rm.model.tracking import log_run
-from walt.utils.sql_exec import ExecutionResult, run_sql
+
+# "constant" needs no --rm-model file (ConstantRewardModel has no trainable state) —
+# combine with --schema-filter to test "first schema-valid LLM candidate, no learned
+# reranking at all" as a baseline against the real RM classes.
+RM_CLASS_CHOICES = ["lr_v3", "lr_v4", "lr_v6", "lr_v7", "distilbert", "constant"]
+RM_CLASS_BY_NAME = {"lr_v3": LRRewardModelV3, "lr_v4": LRRewardModelV4, "lr_v6": LRRewardModelV6, "lr_v7": LRRewardModelV7}
+from walt.utils.sql_exec import (
+    ExecutionResult,
+    capture_db_state,
+    execute_with_context,
+    resolve_context_statements,
+)
 
 
-def _rows_match(a: ExecutionResult, b: ExecutionResult) -> bool:
-    if a.columns != b.columns:
+def _row_sort_key(row: tuple) -> tuple:
+    # sorted() on raw SQL rows can raise TypeError if a column mixes None with a
+    # comparable type across rows (e.g. one row's value is None, another's is a float,
+    # at the same position) — None doesn't order against non-None in Python 3. Encode
+    # "is this None" as a leading bool per value so every row sorts against every other
+    # without ever comparing None to a non-None value directly.
+    return tuple((v is None, v) if v is not None else (True, "") for v in row)
+
+
+def _rows_match(a: ExecutionResult, b: ExecutionResult) -> bool | None:
+    # Deliberately ignores a.columns/b.columns: SQLite auto-labels a result column from
+    # the expression text itself when there's no explicit alias (e.g. `AVG(Age)` vs
+    # `AVG(T1.Age)` for a table-qualified rewrite of the same column) — column *names*
+    # are cosmetic, not part of whether the agent got the right answer. Only the actual
+    # row values (and their count/order within a row) are compared.
+    #
+    # A failed execution (rows=None, success=False) is never a match, regardless of what
+    # the other side looks like — it must NOT be treated as "returned zero rows", or any
+    # candidate that crashes gets silently credited as correct on every question whose
+    # real answer happens to be empty. Returns None (rather than True/False) when both
+    # sides succeeded but neither has a row set at all — non-SELECT statements
+    # (UPDATE/DELETE/INSERT/DDL) always report rows=None on success, so "both None" isn't
+    # evidence of a match either; the caller must fall back to a different comparison
+    # (see _effect_match) for that case instead of defaulting to "equal".
+    if not a.success or not b.success:
         return False
-    return sorted(a.rows or ()) == sorted(b.rows or ())
+    if a.rows is None and b.rows is None:
+        return None
+    if a.rows is None or b.rows is None:
+        return False
+    return sorted(a.rows, key=_row_sort_key) == sorted(b.rows, key=_row_sort_key)
+
+
+def _effect_match(context_statements: Sequence[str], sql_a: str, sql_b: str) -> bool:
+    """Fallback for _rows_match's None case (both statements are non-SELECT, so neither
+    has a row set to compare): re-runs context_statements + each statement from scratch
+    via capture_db_state and compares the full resulting database state (every table's
+    rows) instead. Each side gets its own fresh in-memory DB, so sql_a's effect can never
+    leak into sql_b's run."""
+    ok_a, state_a = capture_db_state(context_statements, sql_a)
+    ok_b, state_b = capture_db_state(context_statements, sql_b)
+    return ok_a and ok_b and state_a == state_b
 
 
 def _rate(count: int, total: int) -> dict[str, Any]:
@@ -47,8 +104,15 @@ def _rate(count: int, total: int) -> dict[str, Any]:
 
 
 def evaluate_agent(val_examples: list[Example], agent: SqlAgent) -> dict[str, Any]:
-    executable = [ex for ex in val_examples if ex.sql_context]
+    executable = [ex for ex in val_examples if ex.sql_context or ex.sql_context_path]
     qa_examples = [ex for ex in executable if ex.sql_context_valid]
+
+    # Rows that carry sql_context_path (see walt.utils.sql_exec.execute_with_context)
+    # reuse a cached in-memory connection across calls that share the same path — sorting
+    # groups those consecutive so the cache stays warm instead of rebuilding per row. Rows
+    # without a path (gretel/spider/dbasql — full sql_context embedded directly) sort
+    # together too, but gain nothing from it since they were never cached to begin with.
+    executable = sorted(executable, key=lambda ex: ex.sql_context_path or "")
 
     rm_pass = base_pass = 0
     rm_qa = base_qa = 0
@@ -66,9 +130,26 @@ def evaluate_agent(val_examples: list[Example], agent: SqlAgent) -> dict[str, An
     mixed_expected_random = 0.0
 
     print(f"Running agent over {len(executable)} executable val rows...")
+    progress_interval = 10  # a status line every N rows -- each involves n_candidates
+    # real LLM calls (Ollama or Claude) plus SQL execution, slow enough that silent
+    # per-row progress can look stuck on a large val set.
+    start = time.perf_counter()
     for i, ex in enumerate(executable, 1):
+        if i % progress_interval == 0 or i == len(executable):
+            elapsed = time.perf_counter() - start
+            rate_per_min = i / elapsed * 60 if elapsed > 0 else 0.0
+            eta_min = (len(executable) - i) / rate_per_min if rate_per_min > 0 else float("inf")
+            print(
+                f"  {i}/{len(executable)} rows ({100 * i / len(executable):.1f}%) | "
+                f"{rate_per_min:.1f} rows/min | elapsed {elapsed / 60:.1f}min | ETA ~{eta_min:.0f}min"
+            )
         try:
-            result = agent.run(ex.question, list(ex.sql_context))
+            result = agent.run(
+                ex.question,
+                list(ex.sql_context),
+                sql_context_clean=list(ex.sql_context_clean),
+                sql_context_path=ex.sql_context_path,
+            )
         except RuntimeError as exc:
             # The LLM produced zero usable candidates for this row (can happen with a
             # small n_candidates against a reasoning model that burns its token budget
@@ -84,16 +165,35 @@ def evaluate_agent(val_examples: list[Example], agent: SqlAgent) -> dict[str, An
         # this row instead of calling the LLM again.
         baseline_sql = result.raw_candidates[0]
         base_execution = (
-            rm_execution if baseline_sql == result.best_sql else run_sql(ex.sql_context, baseline_sql)
+            rm_execution
+            if baseline_sql == result.best_sql
+            else execute_with_context(ex.sql_context, ex.sql_context_path, baseline_sql)
         )
 
         rm_pass += int(rm_execution.success)
         base_pass += int(base_execution.success)
 
         if ex.sql_context_valid:
-            reference = run_sql(ex.sql_context, ex.sql_good)
-            rm_correct = _rows_match(rm_execution, reference)
-            base_correct = _rows_match(base_execution, reference)
+            reference = execute_with_context(ex.sql_context, ex.sql_context_path, ex.sql_good)
+
+            # Lazily resolved: only needed when _rows_match can't decide from row sets
+            # alone (both sides non-SELECT) — never touched for a purely-SELECT dataset
+            # like Spider, so this costs nothing there.
+            _resolved_context_cache: list[tuple[str, ...] | None] = [None]
+
+            def _resolved_context() -> tuple[str, ...]:
+                if _resolved_context_cache[0] is None:
+                    _resolved_context_cache[0] = resolve_context_statements(ex.sql_context, ex.sql_context_path)
+                return _resolved_context_cache[0]
+
+            def _qa_match(execution: ExecutionResult, sql: str) -> bool:
+                match = _rows_match(execution, reference)
+                if match is not None:
+                    return match
+                return _effect_match(_resolved_context(), sql, ex.sql_good)
+
+            rm_correct = _qa_match(rm_execution, result.best_sql)
+            base_correct = _qa_match(base_execution, baseline_sql)
             rm_qa += int(rm_correct)
             base_qa += int(base_correct)
 
@@ -102,8 +202,10 @@ def evaluate_agent(val_examples: list[Example], agent: SqlAgent) -> dict[str, An
             executions_by_sql = {result.best_sql: rm_execution, baseline_sql: base_execution}
             n_correct = 0
             for sql in result.raw_candidates:
-                execution = executions_by_sql.setdefault(sql, run_sql(ex.sql_context, sql))
-                n_correct += int(_rows_match(execution, reference))
+                execution = executions_by_sql.setdefault(
+                    sql, execute_with_context(ex.sql_context, ex.sql_context_path, sql)
+                )
+                n_correct += int(_qa_match(execution, sql))
 
             n_candidates = len(result.raw_candidates)
             if n_correct == n_candidates:
@@ -151,18 +253,29 @@ def evaluate_agent(val_examples: list[Example], agent: SqlAgent) -> dict[str, An
 
 
 def main() -> None:
+    # Stdout is fully buffered by default when redirected to a file (e.g. a
+    # backgrounded run), so evaluate_agent's progress prints wouldn't be visible until
+    # the process exits without this — see build_severity_dataset.py's main().
+    sys.stdout.reconfigure(line_buffering=True)
+
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--input", type=Path, default=Path("data/output/rm_enhanced.jsonl"))
     parser.add_argument("--rm-model", type=Path, default=Path("data/output/rm_model.joblib"))
-    parser.add_argument("--ollama-model", default="llama3.2")
+    parser.add_argument("--rm-class", choices=RM_CLASS_CHOICES, default="lr_v6", help="Which BaseRewardModel subclass --rm-model was saved from")
+    parser.add_argument("--llm-backend", choices=["ollama", "claude"], default="ollama", help="Which LLM generates candidate SQL: local Ollama (default) or the Anthropic API (Claude)")
+    parser.add_argument("--ollama-model", default="llama3.2", help="Model name when --llm-backend ollama")
+    parser.add_argument("--claude-model", default="claude-haiku-4-5-20251001", help="Model name when --llm-backend claude (requires ANTHROPIC_API_KEY)")
     parser.add_argument("--n-candidates", type=int, default=5)
+    parser.add_argument("--ollama-concurrency", type=int, default=1, help="[--llm-backend ollama only] concurrent Ollama requests per row's candidate generation. Only helps once the Ollama server itself accepts concurrent requests (see build_severity_dataset.py docstring) — otherwise pure overhead.")
     parser.add_argument("--limit", type=int, default=None, help="Only evaluate the first N val rows (smoke testing)")
     parser.add_argument("--output", type=Path, default=None, help="Optional path to write the JSON summary")
-    parser.add_argument("--llm-cache", type=Path, default=Path("data/output/llm_cache.json"), help="Cache LLM candidates here, keyed by (question, schema_context) — so re-running with a different --rm-model reuses candidates instead of re-calling the LLM")
+    parser.add_argument("--llm-cache", type=Path, default=None, help="Cache LLM candidates here, keyed by (question, schema_context) — so re-running with a different --rm-model reuses candidates instead of re-calling the LLM. Defaults to data/output/llm_cache.json for --llm-backend ollama, data/output/llm_cache_claude.json for --llm-backend claude — separate files so switching backends never overwrites the other's cached candidates")
     parser.add_argument("--no-llm-cache", action="store_true", help="Always call the LLM fresh, ignoring/skipping the cache")
-    parser.add_argument("--run-name", default=None, help="Label for this run in the run log (default: derived from --rm-model and --ollama-model)")
+    parser.add_argument("--strip-context", action="store_true", help="Don't show the LLM schema_context when generating candidates (still used for execution/reference) — tests unconditioned generation")
+    parser.add_argument("--run-name", default=None, help="Label for this run in the run log (default: derived from --rm-model and the LLM model)")
     parser.add_argument("--runs-dir", type=Path, default=Path("data/output/eval_runs"), help="Directory where agent-eval run records are logged for later comparison (separate from RM training's data/output/runs/ — different metric shape)")
     parser.add_argument("--no-log-run", action="store_true", help="Skip writing a run record (e.g. for throwaway/debug runs)")
+    parser.add_argument("--schema-filter", action="store_true", help="Wrap --rm-model in SchemaFilteredRewardModel — a hard is_schema_valid pre-filter applied before the RM's own scoring (see schema_filter.py). No-op for lr_v6 (already learns this internally); meant for models with no equivalent feature, e.g. distilbert")
     args = parser.parse_args()
 
     examples = load_examples(args.input)
@@ -171,17 +284,31 @@ def main() -> None:
         val_examples = val_examples[: args.limit]
     print(f"Evaluating on {len(val_examples)} val examples")
 
-    embedding_provider = SentenceTransformerEmbedding()
-    rm = LRRewardModelV3.load(args.rm_model, embedding_provider=embedding_provider)
+    if args.rm_class == "constant":
+        rm = ConstantRewardModel()
+    elif args.rm_class == "distilbert":
+        rm = DistilBertRewardModel.load(args.rm_model)
+    else:
+        embedding_provider = SentenceTransformerEmbedding()
+        rm = RM_CLASS_BY_NAME[args.rm_class].load(args.rm_model, embedding_provider=embedding_provider)
+    if args.schema_filter:
+        rm = SchemaFilteredRewardModel(rm)
     rm.warm_cache(val_examples)
 
     rm_metrics = rm.evaluate(val_examples)
     print("\n1. RM accuracy (sql_good vs sql_bad):")
     rm.publish_metrics(rm_metrics)
 
-    llm_cache_path = None if args.no_llm_cache else args.llm_cache
-    llm = build_llm(args.ollama_model, llm_cache_path)
-    agent = SqlAgent(llm=llm, rm=rm, n_candidates=args.n_candidates)
+    llm_model = args.claude_model if args.llm_backend == "claude" else args.ollama_model
+    if args.no_llm_cache:
+        llm_cache_path = None
+    elif args.llm_cache is not None:
+        llm_cache_path = args.llm_cache
+    else:
+        default_cache_name = "llm_cache_claude.json" if args.llm_backend == "claude" else "llm_cache.json"
+        llm_cache_path = Path("data/output") / default_cache_name
+    llm = build_llm(llm_model, llm_cache_path, backend=args.llm_backend, ollama_concurrency=args.ollama_concurrency)
+    agent = SqlAgent(llm=llm, rm=rm, n_candidates=args.n_candidates, strip_llm_context=args.strip_context)
     agent_metrics = evaluate_agent(val_examples, agent)
 
     def _print_line(label: str, stats: dict[str, Any]) -> None:
@@ -219,17 +346,21 @@ def main() -> None:
         print(f"\nWrote summary to {args.output}")
 
     if not args.no_log_run:
-        run_name = args.run_name or f"{args.rm_model.stem}_{args.ollama_model}"
+        run_name = args.run_name or f"{args.rm_model.stem}_{args.llm_backend}_{llm_model}"
         run_path = log_run(
             args.runs_dir,
             run_name=run_name,
-            model_class=f"{type(rm).__name__}+{args.ollama_model}",
+            model_class=f"{type(rm).__name__}+{args.llm_backend}:{llm_model}",
             config={
                 "input": str(args.input),
                 "rm_model": str(args.rm_model),
-                "ollama_model": args.ollama_model,
+                "rm_class": args.rm_class,
+                "schema_filter": args.schema_filter,
+                "llm_backend": args.llm_backend,
+                "llm_model": llm_model,
                 "n_candidates": args.n_candidates,
                 "n_val_examples": len(val_examples),
+                "strip_context": args.strip_context,
             },
             # Flat so a future comparison table/chart can key straight into it, same as
             # rm/model/visualize.py does for top1_accuracy/pairwise_accuracy/mrr.

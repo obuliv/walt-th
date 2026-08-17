@@ -1,12 +1,14 @@
 """Shared machinery for reward model variants that also consume `sql_context` — the
-schema (SQLite CREATE TABLE/INSERT INTO statements) `sql` executes against, carried on
-`Example.sql_context` (see rm/data/base.py). Builds on `LRRewardModelV3` (current best:
-cosine_sim + is_sql_valid), so both context variants below are strict ablations on top
-of it — only `_phi` differs between lr_model_v4.py and lr_model_v5.py.
+schema `sql` executes against, carried on `Example.sql_context_clean` (see
+rm/data/base.py): CREATE TABLE/etc only, INSERT statements stripped via
+`walt.utils.sql_exec.clean_context()` so the embedded context is schema signal, not
+sample-data noise. Builds on `LRRewardModelV3` (current best: cosine_sim +
+is_sql_valid), so both context variants below are strict ablations on top of it — only
+`_phi` differs between lr_model_v4.py and lr_model_v5.py.
 
 Embeds each example's whole context as one vector, keyed by the joined statement text
-(`_context_key`) — the same "\\n".join(...) convention sql_agent.py already uses to
-pass schema_context to the LLM, so cache hits are consistent across the codebase. A row
+(`_context_key`) — the same "\\n".join(...) convention sql_agent.py uses to pass the
+cleaned schema to the LLM, so cache hits are consistent across the codebase. A row
 with no context (e.g. sql_good is itself DDL) gets an all-zero context vector rather
 than an embedding call, handled per-subclass in `_phi` since V4 (a scalar cosine_sim)
 and V5 (a concatenated vector) need different empty-context fallbacks.
@@ -16,7 +18,7 @@ from __future__ import annotations
 import numpy as np
 
 from walt.rm.data.base import Example
-from walt.rm.model.lr_model_v3 import LRRewardModelV3
+from walt.rm.model.lr.lr_model_v3 import LRRewardModelV3
 
 
 class ContextAwareLRRewardModel(LRRewardModelV3):
@@ -38,7 +40,7 @@ class ContextAwareLRRewardModel(LRRewardModelV3):
 
     def warm_cache(self, examples: list[Example]) -> None:
         super().warm_cache(examples)
-        self._embed_context_unique([self._context_key(ex.sql_context) for ex in examples])
+        self._embed_context_unique([self._context_key(ex.sql_context_clean) for ex in examples])
 
     def score(self, question: str, sql: str, sql_context: tuple[str, ...] = ()) -> float:
         # Lazily embeds sql_context on an ad hoc score() call (e.g. from the agent) the

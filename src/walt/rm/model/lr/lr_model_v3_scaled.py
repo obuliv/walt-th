@@ -31,7 +31,7 @@ from sklearn.preprocessing import StandardScaler
 from walt.rm.data.base import Example
 from walt.rm.model.base import all_candidates
 from walt.rm.model.embeddings import EmbeddingProvider, build_provider_from_config
-from walt.rm.model.lr_model_v3 import LRRewardModelV3
+from walt.rm.model.lr.lr_model_v3 import LRRewardModelV3
 from walt.rm.model.sql_features import is_sql_valid
 
 SCALING_CHOICES = ("none", "standardize", "l2_normalize", "l2_normalize_standardize")

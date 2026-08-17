@@ -1,0 +1,23 @@
+{
+  "n_examples": 400,
+  "n_pairs": 1099,
+  "top1_accuracy": 0.74,
+  "pairwise_accuracy": 0.8535031847133758,
+  "mrr": 0.8507499999999998,
+  "pairwise_accuracy_by_reason": {
+    "compound": 0.9457831325301205,
+    "llama": 0.8538461538461538,
+    "misjoined_tables": 0.8960176991150443,
+    "missing_filters": 0.71875,
+    "unsafe_patterns": 0.7876106194690266,
+    "wrong_aggregation": 0.7535211267605634
+  },
+  "n_pairs_by_reason": {
+    "compound": 166,
+    "llama": 130,
+    "misjoined_tables": 452,
+    "missing_filters": 96,
+    "unsafe_patterns": 113,
+    "wrong_aggregation": 142
+  }
+}

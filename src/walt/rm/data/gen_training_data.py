@@ -37,7 +37,8 @@ import anthropic
 import jsonschema
 from dotenv import load_dotenv
 
-from walt.utils.sql_exec import run_sql
+from walt.utils.jsonl_io import open_jsonl
+from walt.utils.sql_exec import clean_context, run_sql
 
 load_dotenv()
 
@@ -172,14 +173,26 @@ dialect — these rows will be executed against an in-memory SQLite database.
 2. Produce `sql_context`: SQLite-compatible CREATE TABLE and INSERT INTO statements, in \
 execution order, defining a minimal schema and a small amount of sample data such that \
 `sql_good` can be run directly against them and returns a meaningful, non-trivial result \
-(at least one row, unless the question's own logic legitimately returns none). If \
-`sql_good` is itself a DDL statement (CREATE/ALTER/DROP TABLE) rather than a query over \
-existing data, return an empty `sql_context` array.
+(at least one row, unless the question's own logic legitimately returns none). Every \
+WHERE/HAVING condition, JOIN key, and aggregation grouping that appears anywhere in \
+`sql_good` or in any `sql_bad` example below must actually matter for the sample data you \
+provide — include at least one row each such condition/join/grouping would include or \
+exclude *differently* than omitting or changing it would. An empty `sql_good` result is \
+only acceptable when the question's own semantics has no answer; otherwise treat it as a \
+signal to add more rows, not to move on. If `sql_good` is itself a DDL statement \
+(CREATE/ALTER/DROP TABLE) rather than a query over existing data, return an empty \
+`sql_context` array.
 3. Produce between 3 and 5 "sql_bad" examples: plausible-looking SQL queries that a \
 competent-but-imperfect model might write for the same question, each containing exactly \
 one meaningful problem. Bad examples must be diverse (no repeated mistake type within the \
 same question) and must be *close misses* that a careless reviewer could mistake for \
-correct — not obviously broken SQL.
+correct — not obviously broken SQL. Before finalizing each one, confirm mentally that \
+executing it against `sql_context` would return a genuinely different result than \
+`sql_good` — not just different-looking SQL. A cosmetic rewrite (renamed alias, reordered \
+columns/clauses, a logically equivalent condition) is not a valid `sql_bad` even if the \
+text looks different; if the sample data isn't rich/diverse enough to make a mistake's \
+effect observable, add the rows needed in `sql_context` rather than keeping a \
+non-distinguishing example.
 4. Tag each sql_bad example with the single reason category from this list that best \
 explains its mistake:
 
@@ -273,7 +286,14 @@ same `sql_context` that a competent-but-imperfect model might write for the same
 question, each containing exactly one meaningful problem. Bad examples must be diverse \
 (no repeated mistake type within the same question) and must be *close misses* that a \
 careless reviewer could mistake for correct — not obviously broken SQL. Every sql_bad \
-query must reference only tables/columns that actually exist in the given sql_context.
+query must reference only tables/columns that actually exist in the given sql_context. \
+Before finalizing each one, confirm mentally that executing it against the given \
+`sql_context` (as-is — you cannot add rows here) would return a genuinely different \
+result than `sql_good`, not just different-looking SQL. A cosmetic rewrite (renamed \
+alias, reordered columns/clauses, a logically equivalent condition) is not a valid \
+sql_bad even if the text looks different; if the sample data is too sparse or uniform \
+for a mistake type to actually change the result, pick a different mistake that this \
+specific data *does* expose rather than keeping a non-distinguishing example.
 
 Tag each sql_bad example with the single reason category from this list that best \
 explains its mistake:
@@ -393,13 +413,125 @@ def validate_result(data: dict[str, Any], has_context: bool) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Empty-result enrichment: a follow-up call for rows where sql_good executes but
+# returns zero rows (SYSTEM_PROMPT/BAD_ONLY_SYSTEM_PROMPT ask the model to avoid this
+# up front, but it's not enforced by the schema, so it's also checked and actively
+# repaired here rather than just hoped for).
+# ---------------------------------------------------------------------------
+
+ENRICH_RESULT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "sql_context_additions": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": (
+                "One or more additional INSERT INTO statements, against the EXISTING "
+                "tables only (same columns/types, no new CREATE TABLE, don't touch "
+                "existing rows), such that executing sql_good against the amended "
+                "sql_context returns at least one row."
+            ),
+        },
+    },
+    "required": ["sql_context_additions"],
+    "additionalProperties": False,
+}
+
+ENRICH_TOOL_NAME = "emit_context_enrichment"
+
+ENRICH_TOOL_SCHEMA = {
+    "name": ENRICH_TOOL_NAME,
+    "description": "Return additional sample-data rows so sql_good returns a non-empty result.",
+    "input_schema": ENRICH_RESULT_SCHEMA,
+}
+
+ENRICH_TOOL_CHOICE = {"type": "tool", "name": ENRICH_TOOL_NAME}
+
+_ENRICH_VALIDATOR = jsonschema.Draft7Validator(ENRICH_RESULT_SCHEMA)
+
+ENRICH_SYSTEM_PROMPT = """You are a meticulous SQL reviewer building training data for a \
+text-to-SQL reward model.
+
+You are given a (question, sql_good, sql_context) triple. sql_good is correct SQL for \
+the question, but executing it against sql_context currently returns zero rows — the \
+sample data doesn't actually exercise sql_good's WHERE/HAVING conditions, JOIN keys, or \
+aggregation grouping. Add one or more INSERT INTO statements, against the tables already \
+defined in sql_context (same columns/types — do not add CREATE TABLE statements or \
+modify existing rows), containing at least one row that sql_good's conditions would \
+actually match, so that running sql_good against the amended sql_context returns a \
+meaningful, non-trivial result.
+
+Call the `emit_context_enrichment` tool exactly once with your result. Do not include \
+any text outside the tool call."""
+
+
+def build_enrich_user_message(question: str, sql_good: str, sql_context: list[str]) -> str:
+    return (
+        f"Question: {question}\n"
+        f"sql_good (already correct, do not change): {sql_good}\n"
+        f"sql_context (currently returns zero rows for sql_good, do not remove or modify "
+        f"any existing statement): {json.dumps(sql_context)}"
+    )
+
+
+def needs_enrichment(record: dict[str, Any]) -> bool:
+    """True iff sql_good is a SELECT (or other row-returning statement) that executes
+    successfully against sql_context but returns zero rows. DDL/INSERT/etc. statements
+    have no result set at all (run_sql returns rows=None, not rows=()) — that's not an
+    "empty result" to fix, so they're excluded here."""
+    execution = run_sql(record.get("sql_context", []), record["sql_good"])
+    return execution.success and execution.rows is not None and len(execution.rows) == 0
+
+
+def enrich_context(client: anthropic.Anthropic, record: dict[str, Any]) -> dict[str, Any]:
+    """One follow-up tool call asking for more INSERT rows so sql_good's result is
+    non-empty. Appends the additions and locally re-verifies (no extra API call for
+    that part); falls back to the original sql_context unchanged if the addition breaks
+    sql_good or still returns zero rows — no retry loop, same trust-then-verify
+    convention as enhance_record."""
+    params = {
+        "model": ANTHROPIC_MODEL,
+        "max_tokens": 1024,
+        "system": ENRICH_SYSTEM_PROMPT,
+        "tools": [ENRICH_TOOL_SCHEMA],
+        "tool_choice": ENRICH_TOOL_CHOICE,
+        "messages": [
+            {
+                "role": "user",
+                "content": build_enrich_user_message(record["question"], record["sql_good"], record.get("sql_context", [])),
+            }
+        ],
+    }
+    try:
+        message = client.messages.create(**params)
+        result = extract_tool_input(message)
+        _ENRICH_VALIDATOR.validate(result)
+    except (ValueError, jsonschema.ValidationError) as exc:
+        print(f"  enrichment call failed, keeping original sql_context: {exc}")
+        return record
+
+    additions = result["sql_context_additions"]
+    candidate_context = list(record.get("sql_context", [])) + additions
+    execution = run_sql(candidate_context, record["sql_good"])
+    if not execution.success or not execution.rows:
+        print("  enrichment did not produce a non-empty result, keeping original sql_context")
+        return record
+
+    enriched = dict(record)
+    enriched["sql_context"] = candidate_context
+    enriched["sql_context_valid"] = True
+    return enriched
+
+
+# ---------------------------------------------------------------------------
 # I/O helpers
 # ---------------------------------------------------------------------------
 
 
 def load_records(input_path: Path) -> list[dict[str, Any]]:
+    """input_path may end in .gz for a gzip-compressed file -- read transparently either way."""
     records = []
-    with input_path.open(encoding="utf-8") as f:
+    with open_jsonl(input_path) as f:
         for line in f:
             line = line.strip()
             if line:
@@ -408,8 +540,9 @@ def load_records(input_path: Path) -> list[dict[str, Any]]:
 
 
 def write_jsonl(records: Iterable[dict[str, Any]], output_path: Path) -> None:
+    """output_path may end in .gz to write gzip-compressed instead of plain text."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("w", encoding="utf-8") as f:
+    with open_jsonl(output_path, "wt") as f:
         for record in records:
             f.write(json.dumps(record) + "\n")
 
@@ -467,6 +600,9 @@ def enhance_record(record: dict[str, Any], result: dict[str, Any]) -> dict[str, 
     # sql_context (freshly synthesized, or reused as-is when the row already had one)?
     execution = run_sql(merged.get("sql_context", []), merged["sql_good"])
     merged["sql_context_valid"] = execution.success
+    # Schema-only view (CREATE TABLE etc, no INSERT rows) — what the LLM/RM should see
+    # instead of the full context (see clean_context()).
+    merged["sql_context_clean"] = list(clean_context(merged.get("sql_context", [])))
     return merged
 
 
@@ -512,6 +648,7 @@ def cmd_test(args: argparse.Namespace) -> None:
         return
 
     results = []
+    enriched_count = 0
     for i, record in enumerate(records, 1):
         mode = "sql_bad-only (context reused)" if has_context(record) else "full"
         print(f"[{i}/{len(records)}] ({mode}) {record['question'][:80]}")
@@ -524,10 +661,18 @@ def cmd_test(args: argparse.Namespace) -> None:
             print(f"  FAILED: {exc}")
             continue
         merged = enhance_record(record, result)
+        if needs_enrichment(merged):
+            print("  sql_good returned an empty result; asking for context enrichment...")
+            before = merged
+            merged = enrich_context(client, merged)
+            if merged is not before:
+                enriched_count += 1
         results.append(merged)
         print(json.dumps(merged, indent=2))
 
     print_context_summary(results)
+    if enriched_count:
+        print(f"Enriched {enriched_count} row(s) that initially returned an empty sql_good result.")
 
     if args.output:
         write_jsonl(results, args.output)
@@ -659,11 +804,22 @@ def cmd_collect(args: argparse.Namespace) -> None:
         output_records.append(enhance_record(record, result))
         counts["succeeded"] += 1
 
+    enriched_count = 0
+    for i, record in enumerate(output_records):
+        if needs_enrichment(record):
+            print(f"  row {i}: sql_good returned an empty result; asking for context enrichment...")
+            enriched = enrich_context(client, record)
+            if enriched is not record:
+                output_records[i] = enriched
+                enriched_count += 1
+
     write_jsonl(output_records, args.output)
     reused = sum(1 for r in records_by_custom_id.values() if has_context(r))
     print(f"\nWrote {len(output_records)} enhanced examples to {args.output}")
     print(f"Counts: {counts}")
     print(f"{reused}/{len(records_by_custom_id)} rows reused an existing sql_context (sql_bad-only).")
+    if enriched_count:
+        print(f"Enriched {enriched_count} row(s) that initially returned an empty sql_good result.")
     print_context_summary(output_records)
 
 

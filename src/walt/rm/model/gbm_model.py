@@ -33,7 +33,8 @@ from sklearn.ensemble import HistGradientBoostingClassifier
 
 from walt.rm.data.base import Example
 from walt.rm.model.embeddings import EmbeddingProvider, build_provider_from_config
-from walt.rm.model.lr_model_v3 import LRRewardModelV3
+from walt.rm.model.lr.lr_model_v3 import LRRewardModelV3
+from walt.utils.sql_exec import normalize_sql
 
 
 class GBMRewardModel(LRRewardModelV3):
@@ -58,10 +59,12 @@ class GBMRewardModel(LRRewardModelV3):
 
         X_rows, y_rows = [], []
         for ex in train_examples:
-            X_rows.append(self._phi(ex.question, ex.sql_good, ex.sql_context))
+            # normalize_sql() to match warm_cache()'s (inherited, unnormalized-input
+            # but normalized-key) cache population — see LRRewardModel.score().
+            X_rows.append(self._phi(ex.question, normalize_sql(ex.sql_good), ex.sql_context))
             y_rows.append(1)
             for bad in ex.sql_bad:
-                X_rows.append(self._phi(ex.question, bad.sql, ex.sql_context))
+                X_rows.append(self._phi(ex.question, normalize_sql(bad.sql), ex.sql_context))
                 y_rows.append(0)
         X = np.stack(X_rows)
         y = np.array(y_rows)
@@ -95,6 +98,7 @@ class GBMRewardModel(LRRewardModelV3):
     def score(self, question: str, sql: str, sql_context: tuple[str, ...] = ()) -> float:
         if self.clf is None:
             raise RuntimeError("GBMRewardModel.score() called before fit()/load()")
+        sql = normalize_sql(sql)
         self._embed_unique([question], self._question_cache)
         self._embed_unique([sql], self._sql_cache)
         phi = self._phi(question, sql, sql_context).reshape(1, -1)

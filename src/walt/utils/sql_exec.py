@@ -7,9 +7,19 @@ candidate.
 """
 from __future__ import annotations
 
+import functools
+import os
 import sqlite3
+from collections import Counter
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Sequence
+
+import sqlglot
+import sqlglot.expressions as exp
+from dotenv import load_dotenv
+
+load_dotenv()
 
 
 @dataclass(frozen=True)
@@ -18,6 +28,40 @@ class ExecutionResult:
     columns: tuple[str, ...] | None
     rows: tuple[tuple, ...] | None
     error: str | None
+
+
+@functools.lru_cache(maxsize=None)
+def _is_insert(statement: str) -> bool:
+    try:
+        return isinstance(sqlglot.parse_one(statement, dialect="sqlite"), exp.Insert)
+    except Exception:
+        # Same lenient fallback as gretel.py's split_sql_context — a handful of context
+        # statements use syntax sqlglot's sqlite dialect rejects.
+        return statement.strip().upper().startswith("INSERT")
+
+
+@functools.lru_cache(maxsize=None)
+def normalize_sql(sql: str) -> str:
+    """Renders sql through a sqlglot parse/print round-trip (dialect="sqlite") so two
+    queries that only differ in capitalization/whitespace/formatting normalize to
+    identical text. Falls back to the original (stripped) text on a parse error rather
+    than raising — callers that need to distinguish "parsed fine" from "fell back"
+    should parse separately (e.g. is_sql_valid). Cached since callers hit this
+    repeatedly for the same sql_good/sql_bad strings across an embedding pass."""
+    try:
+        return sqlglot.parse_one(sql, dialect="sqlite").sql(dialect="sqlite")
+    except Exception:
+        return sql.strip()
+
+
+def clean_context(context_statements: Sequence[str]) -> tuple[str, ...]:
+    """Drops INSERT statements from context_statements, keeping only schema-defining
+    ones (CREATE TABLE and any other non-INSERT statement, e.g. CREATE VIEW/INDEX) — the
+    schema an LLM/RM needs to reason about a query, without the sample-data noise that
+    isn't relevant to whether a candidate SQL query is well-formed for that schema.
+    Sample data is still needed for execution/QA-accuracy checks, so callers that
+    execute SQL should keep using the original context_statements, not this."""
+    return tuple(s for s in context_statements if not _is_insert(s))
 
 
 def run_sql(context_statements: Sequence[str], sql: str, timeout: float = 5.0) -> ExecutionResult:
@@ -36,5 +80,207 @@ def run_sql(context_statements: Sequence[str], sql: str, timeout: float = 5.0) -
         return ExecutionResult(success=True, columns=columns, rows=rows, error=None)
     except sqlite3.Error as exc:
         return ExecutionResult(success=False, columns=None, rows=None, error=str(exc))
+    finally:
+        conn.close()
+
+
+def _resolve_sqlite_path(relative_path: str) -> Path:
+    """Resolves an Example.sql_context_path (always relative to $DATA_PATH — see
+    rm/data/base.py) to an absolute Path. Raises RuntimeError if DATA_PATH is unset, same
+    convention as walt.rm.data.pre_process's DATA_DIR resolution."""
+    data_path = os.environ.get("DATA_PATH")
+    if not data_path:
+        raise RuntimeError("DATA_PATH must be set to resolve a relative sql_context_path")
+    return Path(data_path).expanduser().resolve() / relative_path
+
+
+def _sql_literal(value: object) -> str:
+    if value is None:
+        return "NULL"
+    if isinstance(value, (int, float)):
+        return repr(value)
+    if isinstance(value, bytes):
+        return "X'" + value.hex() + "'"
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def load_context_from_sqlite(sqlite_path: Path, timeout: float = 5.0) -> tuple[str, ...]:
+    """Reconstructs the exact CREATE TABLE + INSERT INTO statements needed to recreate
+    sqlite_path's contents, read directly (sqlite_master for DDL, one INSERT per row for
+    data) against a read-only connection (never mutates the source file) — the single
+    shared implementation callers use instead of hand-deriving INSERT statements or
+    trusting a possibly-stale schema.sql. Deliberately does NOT use
+    sqlite3.Connection.iterdump(): as of Python 3.12, iterdump() runs `PRAGMA
+    foreign_key_check` internally and raises sqlite3.OperationalError on any real FK
+    inconsistency in the source data (encountered on a real Spider database) — a
+    pre-existing data-quality issue in the source we have no reason to fail on here,
+    since we only need the CREATE TABLE/INSERT INTO text, not iterdump's FK validation."""
+    conn = sqlite3.connect(f"file:{sqlite_path}?mode=ro", uri=True, timeout=timeout)
+    # A handful of real Spider databases contain TEXT columns with non-UTF-8 byte
+    # sequences (encoding mistakes in the original sample data); the default text_factory
+    # raises OperationalError on those rather than silently corrupting them, which would
+    # otherwise abort extraction for an entire database over a few bad bytes.
+    conn.text_factory = lambda b: b.decode("utf-8", errors="replace")
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type='table' AND sql IS NOT NULL "
+            "AND name NOT LIKE 'sqlite_%' ORDER BY rowid"
+        )
+        tables = cursor.fetchall()
+        statements = [sql for _name, sql in tables]
+        for name, _sql in tables:
+            data_cursor = conn.cursor()
+            data_cursor.execute(f'SELECT * FROM "{name}"')
+            columns = [d[0] for d in data_cursor.description]
+            col_list = ", ".join(f'"{c}"' for c in columns)
+            for row in data_cursor:
+                values = ", ".join(_sql_literal(v) for v in row)
+                statements.append(f'INSERT INTO "{name}" ({col_list}) VALUES ({values});')
+        return tuple(statements)
+    finally:
+        conn.close()
+
+
+def resolve_context_statements(sql_context: Sequence[str], sql_context_path: str | None) -> tuple[str, ...]:
+    """Returns sql_context as-is (non-empty) — otherwise loads the full context from
+    sql_context_path via load_context_from_sqlite. Unlike execute_with_context (which
+    executes one query, with caching), this returns the raw statement tuple itself, for
+    callers that need the list directly rather than through run_sql — e.g.
+    add_llama_negatives.py's clean_context(context)/_comparison_signal(context, ...)
+    calls, which predate sql_context_path and expect a plain Sequence[str]."""
+    if sql_context:
+        return tuple(sql_context)
+    if not sql_context_path:
+        return ()
+    return load_context_from_sqlite(_resolve_sqlite_path(sql_context_path))
+
+
+_MUTATING_TYPES = (exp.Insert, exp.Update, exp.Delete, exp.Create, exp.Drop, exp.Alter)
+
+
+@functools.lru_cache(maxsize=None)
+def _is_mutating(sql: str) -> bool:
+    """True if sql parses to an INSERT/UPDATE/DELETE/CREATE/DROP/ALTER statement, or fails
+    to parse at all — a conservative default, since being wrong here (serving stale cached
+    state) is a correctness bug, not just an unnecessary cache miss."""
+    try:
+        return isinstance(sqlglot.parse_one(sql, dialect="sqlite"), _MUTATING_TYPES)
+    except Exception:
+        return True
+
+
+def execute_on_connection(conn: sqlite3.Connection, sql: str) -> ExecutionResult:
+    """Executes sql against an already-open connection — the building block both
+    build_connection's callers and execute_with_context's cache use, so a caller that
+    needs to run many queries against the same static context (e.g. dataset generation's
+    pair/candidate verification, not just Example execution) can reuse one connection
+    directly instead of going through the sql_context_path cache, which is keyed and
+    invalidated for a different use case (many different Examples' contexts over a
+    session, not one context checked many times in a tight loop)."""
+    cursor = conn.cursor()
+    try:
+        cursor.execute(sql)
+        if cursor.description is not None:
+            columns = tuple(col[0] for col in cursor.description)
+            rows = tuple(cursor.fetchall())
+        else:
+            columns, rows = None, None
+        conn.commit()
+        return ExecutionResult(success=True, columns=columns, rows=rows, error=None)
+    except sqlite3.Error as exc:
+        return ExecutionResult(success=False, columns=None, rows=None, error=str(exc))
+
+
+def build_connection(context_statements: Sequence[str], timeout: float = 5.0) -> sqlite3.Connection:
+    """Builds a fresh in-memory connection from context_statements once. Raises
+    sqlite3.Error if any statement fails (unlike run_sql, which swallows this into a
+    failed ExecutionResult) — callers building a connection to reuse across many queries
+    want to know immediately if the context itself is broken, not after their first query."""
+    conn = sqlite3.connect(":memory:", timeout=timeout)
+    cursor = conn.cursor()
+    for statement in context_statements:
+        cursor.execute(statement)
+    conn.commit()
+    return conn
+
+
+# Keyed by sql_context_path (relative to $DATA_PATH), not the resolved absolute path, since
+# that's what callers naturally have on hand (Example.sql_context_path) — see
+# execute_with_context.
+_connection_cache: dict[str, sqlite3.Connection] = {}
+
+
+def execute_with_context(
+    sql_context: Sequence[str], sql_context_path: str | None, sql: str, timeout: float = 5.0
+) -> ExecutionResult:
+    """Executes sql against an Example's context, transparently handling either storage
+    form (see Example.sql_context/.sql_context_path in rm/data/base.py):
+
+    - sql_context non-empty: identical to run_sql(sql_context, sql) — a fresh in-memory DB
+      is built and torn down every call, exactly as before. No caching; this is the path
+      gretel/spider/dbasql rows take, unaffected by anything below.
+    - sql_context empty and sql_context_path set: resolves the path and reuses a cached
+      in-memory connection keyed by sql_context_path across calls, built once (via
+      load_context_from_sqlite) on first use. This avoids rebuilding the same DB's
+      (potentially large) INSERT statements from scratch for every row/candidate that
+      shares it — e.g. evaluating hundreds of val rows spanning a couple dozen distinct
+      source DBs. The moment sql is a mutating statement (per _is_mutating), the cache
+      entry is closed and evicted right after this call, so the next call against the same
+      path rebuilds fresh from the original file — guaranteeing no mutation from one call
+      ever leaks into another's result, the same guarantee run_sql's always-rebuild
+      approach gives for free.
+    - neither set: same as run_sql((), sql).
+    """
+    if sql_context:
+        return run_sql(sql_context, sql, timeout=timeout)
+    if not sql_context_path:
+        return run_sql((), sql, timeout=timeout)
+
+    conn = _connection_cache.get(sql_context_path)
+    if conn is None:
+        sqlite_path = _resolve_sqlite_path(sql_context_path)
+        try:
+            conn = build_connection(load_context_from_sqlite(sqlite_path, timeout=timeout), timeout=timeout)
+        except sqlite3.Error as exc:
+            return ExecutionResult(success=False, columns=None, rows=None, error=str(exc))
+        _connection_cache[sql_context_path] = conn
+
+    try:
+        return execute_on_connection(conn, sql)
+    finally:
+        if _is_mutating(sql):
+            conn.close()
+            del _connection_cache[sql_context_path]
+
+
+def capture_db_state(context_statements: Sequence[str], sql: str, timeout: float = 5.0) -> tuple[bool, dict[str, Counter] | None]:
+    """Executes context_statements followed by sql against a fresh in-memory SQLite DB,
+    then returns (True, state) where state is {table_or_view_name: Counter(rows)}
+    covering every row of every table/view afterward — or (False, None) on any
+    execution error.
+
+    For a statement that doesn't return a result set (UPDATE/DELETE/INSERT/CREATE VIEW/
+    etc — run_sql's rows is None for these), comparing two such statements' rows tells
+    you nothing: both are None regardless of what the statements actually did. This
+    compares their *effect* on the database instead. Counter (not a plain set) so
+    duplicate rows in a table aren't collapsed into one when comparing.
+    """
+    conn = sqlite3.connect(":memory:", timeout=timeout)
+    try:
+        cursor = conn.cursor()
+        for statement in context_statements:
+            cursor.execute(statement)
+        cursor.execute(sql)
+        conn.commit()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type IN ('table', 'view')")
+        names = [row[0] for row in cursor.fetchall()]
+        state = {}
+        for name in names:
+            cursor.execute(f'SELECT * FROM "{name}"')
+            state[name] = Counter(cursor.fetchall())
+        return True, state
+    except sqlite3.Error:
+        return False, None
     finally:
         conn.close()

@@ -43,7 +43,7 @@ AXIS = "#c3c2b7"
 
 
 def print_table(runs: list[dict]) -> None:
-    headers = ["run_name", "timestamp", "ollama_model", *TABLE_KEYS, "n_val"]
+    headers = ["run_name", "timestamp", "llm_model", *TABLE_KEYS, "n_val"]
     rows = []
     for run in runs:
         cfg = run["config"]
@@ -57,7 +57,9 @@ def print_table(runs: list[dict]) -> None:
             [
                 run["run_name"],
                 run["timestamp"],
-                cfg.get("ollama_model", "?"),
+                # llm_model/llm_backend are the current config keys (evaluate.py); older
+                # run records only have ollama_model, from before --llm-backend existed.
+                cfg.get("llm_model", cfg.get("ollama_model", "?")),
                 *(fmt(k) for k in TABLE_KEYS),
                 str(cfg.get("n_val_examples", "?")),
             ]

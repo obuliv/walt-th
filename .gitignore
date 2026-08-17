@@ -233,6 +233,14 @@ Thumbs.db
 # Raw gretelai/synthetic_text_to_sql parquet cache (downloaded by build_gretel_dataset.py;
 # too large to track, and trivially re-downloadable) — the sampled JSONL output is committed.
 data/gretel/
+data/output/runs/
+
+# Official Spider release (manually downloaded from https://yale-lily.github.io/spider,
+# placed here by hand — not auto-fetched). Large/binary; synth_data.jsonl rows reference it
+# via sql_context_path (relative to $DATA_PATH) instead of embedding it, so this must stay
+# present locally for anything that executes SQL against synth rows (agent/eval) to work —
+# RM training only needs sql_context_clean, which is embedded in the committed JSONL.
+data/spider/
 
 # Secrets / credentials
 *.pem

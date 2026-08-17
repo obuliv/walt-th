@@ -1,21 +1,22 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Guidance for Claude Code (claude.ai/code) when working in this repository.
+
+**The full experiment log — every baseline, ablation, negative result, and the reasoning
+behind the current defaults — lives in [`docs/experiments.md`](docs/experiments.md).**
+This file keeps only structure, commands, and current state; read the log before
+re-running an experiment or changing a tuned default.
 
 ## Project
 
-`walt` builds training data for a text-to-SQL reward model. It ingests raw
-question/SQL datasets, standardizes and downsamples them, then uses the
-Anthropic API to correct the SQL and synthesize labeled negative ("sql_bad")
-examples for RM training.
-
-`src/walt/agent/` (LLM candidate generation → RM reranking → toy-SQLite execution) and
-`src/walt/eval/` (agent-level evaluation on a held-out val split) are now implemented —
-see Architecture below.
+`walt` builds training data for a text-to-SQL reward model (RM), then uses that RM to
+rerank an LLM's SQL candidates. Three parts: `src/walt/rm/` (data pipelines + RM
+training/eval), `src/walt/agent/` (LLM candidate generation → RM reranking →
+SQLite execution), `src/walt/eval/` (agent-level evaluation on a held-out val split).
 
 ## Setup
 
-Dependency management is via `uv` (see `uv.lock`).
+Dependency management is via `uv` (see `uv.lock`):
 
 ```bash
 uv sync
@@ -26,489 +27,316 @@ Requires a `.env` file (see `.env.example`) with:
 - `ANTHROPIC_API_KEY` — required for `gen_training_data.py`
 - `ANTHROPIC_MODEL` — defaults to `claude-sonnet-5` if unset
 
-Adding the RM training dependencies (numpy, scikit-learn, sentence-transformers) pins
-`transformers<5`: the default embedding model's `trust_remote_code=True` custom modeling
-code imports `find_pruneable_heads_and_indices` from `transformers.pytorch_utils`, which
-transformers v5 removed. `uv add "transformers<5"` if this regresses.
+Gotchas:
+- RM training deps pin `transformers<5`: the default embedding model's
+  `trust_remote_code=True` code imports `find_pruneable_heads_and_indices` from
+  `transformers.pytorch_utils`, removed in v5. `uv add "transformers<5"` if this regresses.
+- The agent needs a local Ollama server with `llama3.2` pulled (`ollama pull llama3.2`) —
+  no API key, no network at inference time.
+- `walt.rm.data.synth` needs the official Spider release at `$DATA_PATH/spider/`
+  (download from https://yale-lily.github.io/spider — Google Drive only, not automatable)
+  extracted so `$DATA_PATH/spider/database/<db_id>/<db_id>.sqlite` and
+  `$DATA_PATH/spider/{train_spider,train_others,dev}.json` exist. Gitignored, one-time
+  manual step; every other raw source is committed or self-downloaded.
 
-The SQL agent (`src/walt/agent/`) requires a local Ollama server with `llama3.2` pulled
-(`ollama pull llama3.2`) — no API key, no network dependency at inference time.
+There is no test suite or lint config (`tests/` is an empty package stub; no
+pytest/ruff/mypy in `pyproject.toml`).
 
 ## Commands
 
-Run modules with `uv run python -m ...` (or activate `.venv` and drop the `uv run`).
+Run modules with `uv run python -m ...` (or activate `.venv` and drop `uv run`).
 
-Build the standardized/downsampled dataset from all registered sources — `--val-fraction`
-(default `0.15`) stamps each row `split="val"` or `"trainval"`; `val` rows are held out
-for agent-level evaluation and never seen by RM training/CV (see Architecture):
+### Build a dataset (four independent pipelines — see Architecture)
+
 ```bash
+# 1. spider/dbasql via registered adapters; --val-fraction stamps split=val/trainval
 uv run python -m walt.rm.data.pre_process --target-count 5000 --val-fraction 0.15 --output data/output/rm_data.jsonl
-```
 
-Alternatively, build the gretel-only dataset (own pipeline, own output location — see
-Architecture) by sampling directly from gretel's own train/test splits:
-```bash
+# 2. gretel-only (ships its own sql_context + train/test split)
 uv run python -m walt.rm.data.build_gretel_dataset --train-count 2000 --test-count 200
+
+# 3. Spider synth, deterministic rule-based sql_bad (no LLM step needed)
+uv run python -m walt.rm.data.synth.build_synth_dataset --shortlist-only  # print candidate DBs, generate nothing
+uv run python -m walt.rm.data.synth.build_synth_dataset --train-count 2000 --val-count 300
+
+# 4. Spider synth, severity-scored: sql_bad from llama3.2's real mistakes + a Claude
+#    reason/0-5-severity pass (`test` is a required gate before `submit`)
+uv run python -m walt.rm.data.synth.build_severity_dataset --train-count 2000 --val-count 300
+uv run python -m walt.rm.data.synth.enhance_severity_dataset test --input data/output/synth_severity/synth_severity_data.jsonl --limit 5
+uv run python -m walt.rm.data.synth.enhance_severity_dataset submit --input data/output/synth_severity/synth_severity_data.jsonl
+uv run python -m walt.rm.data.synth.enhance_severity_dataset collect --batch-id msgbatch_xxx --output data/output/synth_severity/synth_severity_enhanced.jsonl
 ```
 
-Generate `sql_bad` negatives, correct `sql_good`, and synthesize an executable SQLite
-`sql_context` via Claude (three modes) — both `test` and `collect` print an aggregate
-`sql_good execution check: N/M passed (...%)` summary so data quality can be judged
-before training on it. Rows that already carry a verified `sql_context` (e.g. from
-`build_gretel_dataset.py`) automatically skip `sql_good`/`sql_context` generation and
-only get `sql_bad` (see Architecture); rows with a `sql_context` already known invalid
-are skipped entirely, printed as `Skipping N row(s) with a known-invalid sql_context`:
+### LLM data generation / repair (all `test` → `submit` → `collect`)
+
+`test` = sync, cheap prompt iteration; `submit` = Anthropic Message Batch; `collect` =
+poll + merge. Batch state is cached under `src/walt/rm/data/.batch_state/<batch_id>.json`
+so `collect` is independent of `submit`. `test`/`collect` print a
+`sql_good execution check: N/M passed` summary so data quality is visible before training.
+
 ```bash
-# iterate on the prompt cheaply, synchronous calls on a few rows
+# sql_bad + sql_good correction + synthesized sql_context (bad-only mode for rows that
+# already carry a verified sql_context, e.g. gretel; known-invalid contexts are skipped)
 uv run python -m walt.rm.data.gen_training_data test --input data/output/rm_data.jsonl --limit 3
-
-# submit the full file as an Anthropic Message Batch job
 uv run python -m walt.rm.data.gen_training_data submit --input data/output/rm_data.jsonl
-
-# poll a submitted batch and write the merged output JSONL
 uv run python -m walt.rm.data.gen_training_data collect --batch-id msgbatch_xxx --output data/output/rm_enhanced.jsonl
+
+# repair sql_bad candidates whose result doesn't actually differ from sql_good's; only
+# affected rows are sent to the LLM, row set/order is always preserved
+uv run python -m walt.rm.data.fix_sql_bad test --input data/output/gretel/gretel_enhanced.jsonl --limit 3
+uv run python -m walt.rm.data.fix_sql_bad submit --input data/output/gretel/gretel_enhanced.jsonl
+uv run python -m walt.rm.data.fix_sql_bad collect --batch-id msgbatch_xxx --output data/output/gretel/gretel_enhanced_fixed.jsonl
 ```
 
-Train a pairwise-ranking reward model on `rm_enhanced.jsonl`, evaluate on a held-out
-split, and check the train/test gap for overfitting (`--model` selects `lr_v1`/`lr_v2`/
-`lr_v3`/`lr_v4`/`lr_v5`/`gbm` — v4/v5 also consume `sql_context`, see Architecture below
-for why neither beats v3 — default `lr_v3` with `--C 30`; see Architecture below for why):
+### Train / cross-validate / compare
+
+`--model` selects `lr_v1`..`lr_v6`/`gbm`/`distilbert`; defaults are `lr_v6` and `--C 300`
+(CV-tuned for `lr_v6` on gretel-only data — re-sweep `C` for any new dataset or penalty).
+
 ```bash
 uv run python -m walt.rm.model.train \
   --input data/output/rm_enhanced.jsonl \
   --model-output data/output/rm_model.joblib \
   --metrics-output data/output/rm_metrics.json
+
+# distilbert: run the preflight first (token lengths + MPS sanity)
+uv run python -m walt.rm.model.distilbert_preflight --input data/output/gretel/gretel_enhanced.jsonl
+uv run python -m walt.rm.model.train --input data/output/gretel/gretel_enhanced.jsonl --model distilbert --model-output data/output/rm_model_distilbert.pt
+
+# a single 80/20 split is too noisy to trust small deltas — cross-validate instead
+uv run python -m walt.rm.model.cross_validate --model lr_v6 --C 300
+
+uv run python -m walt.rm.model.visualize  # table + data/output/runs/comparison.png
 ```
 
-A single 80/20 split is noisy (`--seed 7` vs `--seed 42` alone swung top1_accuracy by
-~1.5pp on `lr_v1`) — before trusting a delta between configs, cross-validate instead:
-```bash
-uv run python -m walt.rm.model.cross_validate --model lr_v3 --C 30
-```
-`cross_validate.py` shares `train.py`'s model/hyperparameter flags, runs k-fold (default
-5) question-level CV, prints mean±std per metric, and logs a run record the same way
-(`metrics` = per-fold means, full per-fold detail under `training.cv`).
+Every `train.py`/`cross_validate.py` run logs JSON to `data/output/runs/`
+(`--run-name`/`--runs-dir`, or `--no-log-run`): `config`, `metrics` (headline scores +
+`pairwise_accuracy_by_reason`), `training` (fit diagnostics; per-fold CV detail under
+`training.cv`), and `train_metrics`/`overfitting_gap`. Only `metrics` is charted.
 
-Every `train.py` run also logs a JSON record to `data/output/runs/` (override with
-`--run-name`/`--runs-dir`, or skip with `--no-log-run`), so different
-approaches/hyperparameters can be compared later. Each record has `config` (input,
-model choice, embedding model, split params, row-skip counts), `metrics` (the headline
-scores plus a `pairwise_accuracy_by_reason` breakdown by mistake category), `training`
-(fit-time diagnostics: LR convergence, embedding/fit/eval timing, feature dim, label
-balance), and `train_metrics`/`overfitting_gap` (evaluate() re-run on the training set,
-and the train-minus-test gap on the headline metrics) — everything except `metrics` is
-recorded for future debugging but deliberately not part of what `visualize.py` charts.
-Compare accumulated runs (prints a table, writes a chart to
-`data/output/runs/comparison.png`):
-```bash
-uv run python -m walt.rm.model.visualize
-```
+### Run / evaluate the agent
 
-Run the SQL agent (LLM candidates → RM rerank → SQLite execution) on one row of a
-`sql_context`-bearing JSONL, or an ad hoc question:
 ```bash
 uv run python -m walt.agent.sql_agent --input data/output/rm_enhanced.jsonl --index 0
 uv run python -m walt.agent.sql_agent --question "..." --schema-file schema.sql
-```
 
-Evaluate the agent end-to-end on the held-out `split="val"` rows (RM good-vs-bad
-accuracy, SQL execution pass/fail, end-to-end QA accuracy — each of the latter two
-reported both with RM reranking and without, i.e. just the first LLM candidate). Like
-`train.py`, each run logs a JSON record (via the same `tracking.log_run`/`load_runs`,
-just pointed at a separate `data/output/eval_runs/` — different metric shape than RM
-training runs) so history can be compared later:
-```bash
 uv run python -m walt.eval.evaluate --input data/output/rm_enhanced.jsonl --rm-model data/output/rm_model.joblib
-uv run python -m walt.eval.visualize  # table + comparison.png across logged eval runs
+uv run python -m walt.eval.visualize  # table + comparison.png across data/output/eval_runs/
 ```
-Both `sql_agent.py` and `evaluate.py` cache generated LLM candidates to
-`data/output/llm_cache.json` by default (`--no-llm-cache` to disable), keyed by
-`(model, question, schema_context)` — re-running `evaluate.py` against a different
-`--rm-model` reuses the cache instead of re-calling Ollama, so RM iteration (and its
-history log) is fast even though LLM generation isn't.
 
-There is no test suite or lint config configured yet (`tests/` is an empty
-package stub, no pytest/ruff/mypy in `pyproject.toml`).
+`evaluate.py` also takes `--rm-class` (incl. `constant` — a zero-signal scorer that
+degrades to the LLM's own candidate order) and `--schema-filter` (hard `is_schema_valid`
+pre-filter wrapping any model). Both `sql_agent.py` and `evaluate.py` cache LLM
+candidates to `data/output/llm_cache.json` (`--no-llm-cache` to disable), keyed by
+`(model, question, schema_context)` — **not** by `n` (fewer candidates than cached are
+served by slicing) and **not** by prompt text, so editing `OllamaLLM.SYSTEM_PROMPT` does
+not invalidate the cache (known gap). RM iteration therefore costs no new LLM calls.
 
 ## Architecture
 
-**Data pipeline (`src/walt/rm/data/`)** runs in two sequential stages:
+Output convention: JSONL under `data/output/`, one JSON object per line. Each pipeline
+owns its own output directory and never merges into another's.
 
-1. **Adapters → standardized examples** (`base.py`, `spider.py`, `dbasql.py`):
-   Each source has a `BaseAdapter` subclass that parses its own raw file
-   format (Spider's CSV, DBASQL's JSON) and yields `Example(question,
-   sql_good, source)` records. To add a new dataset, subclass `BaseAdapter`,
-   implement `load()`, and register it in `pre_process.py`'s `SOURCES` dict.
+### Data pipelines (`src/walt/rm/data/`)
 
-2. **`pre_process.py`** (module name is `walt.rm.data.pre_process`, entry
-   point historically called "launcher" — check the module docstring, it
-   lags a prior rename) loads every registered source, proportionally
-   downsamples each to hit `--target-count` total (never upsamples), shuffles
-   with a fixed seed, and writes standardized JSONL.
+Four independent pipelines produce the same `Example` shape:
 
-3. **`gen_training_data.py`** takes that JSONL and, per row, calls Claude
-   with a tool-forced schema (`emit_sql_review`) to: (a) correct `sql_good`
-   if it has a bug, (b) synthesize 3-5 `sql_bad` variants, each tagged with a
-   mistake category from `BAD_SQL_REASONS` (`missing_filters`,
-   `wrong_aggregation`, `unsafe_patterns`, `misjoined_tables`), and (c)
-   synthesize `sql_context` — SQLite `CREATE TABLE`/`INSERT INTO` statements
-   `sql_good` can actually execute against, verified locally afterward (no
-   extra API call, see "Data regeneration" below). The system prompt + few-shot
-   examples are defined in this file — edit `FEW_SHOT_EXAMPLES` and
-   `BAD_SQL_REASONS` together when tuning quality. Supports `test` (sync,
-   cheap iteration), `submit` (async Message Batch, cheaper at scale), and
-   `collect` (poll + merge) modes; batch state is cached locally in
-   `src/walt/rm/data/.batch_state/<batch_id>.json` so `collect` can be
-   re-run independently of `submit`.
+1. **Adapters + `pre_process.py`** — a `BaseAdapter` subclass per source (`spider.py`,
+   `dbasql.py`) parses its raw format and yields `Example(question, sql_good, source)`;
+   to add a dataset, subclass `BaseAdapter`, implement `load()`, register it in
+   `pre_process.py`'s `SOURCES`. `pre_process.py` proportionally downsamples to
+   `--target-count` (never upsamples), shuffles with a fixed seed, stamps
+   `split="trainval"/"val"`, writes `rm_data.jsonl`. Then `gen_training_data.py`
+   (Claude, tool-forced `emit_sql_review`) corrects `sql_good`, synthesizes 3-5 `sql_bad`
+   variants tagged with a `BAD_SQL_REASONS` category (`missing_filters`,
+   `wrong_aggregation`, `unsafe_patterns`, `misjoined_tables`), and synthesizes an
+   executable SQLite `sql_context`, locally verified (`sql_context_valid`). Edit
+   `FEW_SHOT_EXAMPLES` and `BAD_SQL_REASONS` together when tuning quality. A
+   `needs_enrichment()`/`enrich_context()` follow-up call adds `INSERT` rows when a
+   `SELECT`-shaped `sql_good` executes but returns zero rows (append-only, re-verified;
+   note it checks `rows is not None and len(rows) == 0`, not falsy `rows` — the latter
+   also matches DDL rows). → `rm_enhanced.jsonl`.
+2. **gretel** (`gretel.py`/`build_gretel_dataset.py`) — `gretelai/synthetic_text_to_sql`
+   ships its own `sql_context` and train/test split, so no synthesis or re-splitting.
+   `GretelAdapter` downloads the HF parquet directly (`pyarrow`), splits the joined
+   `sql_context` via `sqlglot` (naive `;`-split fallback for non-SQLite-dialect rows),
+   and verifies each statement at extraction time. `gen_training_data.py` branches on
+   `has_context()` into a `emit_sql_bad`-only call for these rows. →
+   `data/output/gretel/` (and `data/output/gretel_opus/` for the `ANTHROPIC_MODEL=claude-opus-5`
+   rerun).
+3. **`synth/`, deterministic** (`build_synth_dataset.py`) — real Spider SQLite DBs + gold
+   SQL; `sql_bad` from a rule-based sqlglot-AST corruptor (`corrupt.py`: the 4 base
+   reasons plus `compound`), every candidate verified against the real DB. Rows carry
+   `sql_context_path` (relative to `$DATA_PATH`) instead of an embedded `sql_context`.
+   `spider_source.py` shortlists/accumulates databases until the target row count is
+   reached; `trainval` comes from `train_spider`/`train_others` DBs and `val` from
+   `dev.json` DBs, which are **fully disjoint database sets** — a stronger held-out
+   guarantee than any other source here. `MAX_SQLITE_SIZE_BYTES` (5MB) excludes three
+   huge outlier DBs (`soccer_1`, `wta_1`, `baseball_1`).
+4. **`synth/`, severity-scored** (`build_severity_dataset.py` + `enhance_severity_dataset.py`)
+   — reuses `spider_source.py`'s DB/pair selection unchanged, but `sql_bad` comes from
+   `llama3.2`'s own generation mistakes (verified via `corrupt.verify_candidate()`;
+   same-result candidates are kept with a `matches_gold` hint, non-SELECT candidates are
+   recorded un-executed so they can't corrupt the shared per-DB connection), then one
+   Claude `emit_severity_review` call per row assigns a reason + 0-5 severity and
+   backfills up to 3 new candidates for thin coverage. Reason taxonomy = the 5 synth
+   categories plus `llama` as a catch-all — `llama` is valid only for categorizing an
+   existing candidate, never for a Claude-proposed new one (enforced by a separate
+   stricter JSON schema). `matches_gold` is a **hint, not a rule**: a nonzero severity is
+   trusted over it, but a severity=0 claim contradicting real execution is clamped to 1.
+   → `data/output/synth_severity/`.
 
-Output convention: JSONL files under `data/output/`, one JSON object per
-line (`rm_data.jsonl` = stage 2 output, `rm_enhanced.jsonl` = stage 3
-output).
+Supporting: `filter_schema_valid.py` (drops schema-invalid `sql_bad` uniformly),
+`add_llama_negatives.py` (folds `llama3.2`'s wrong candidates in as `reason="llama"`
+negatives).
 
-**gretel (`gretel.py`/`build_gretel_dataset.py`, 2026-08-15)** is a second, parallel
-pipeline outside the `pre_process.py`/`SOURCES` flow above, for
-`gretelai/synthetic_text_to_sql` — added because that dataset already ships its own
-`sql_context` per row (no LLM synthesis needed) and its own train/test split (no
-re-splitting needed). `GretelAdapter` downloads the HF-hosted parquet directly
-(`pyarrow`, no `datasets` dependency needed), splits the dataset's single
-semicolon-joined `sql_context` string into individual statements via `sqlglot` (falls
-back to a naive `;`-split on a sqlglot parse error — a handful of rows use
-non-SQLite-dialect syntax sqlglot's sqlite mode rejects), and verifies each locally via
-`run_sql()` at extraction time rather than deferring to `gen_training_data.py`.
-`build_gretel_dataset.py` samples exactly `--train-count`/`--test-count` rows from
-gretel's own `train`/`test` splits (mapped to our `split="trainval"`/`"val"` — never
-re-splitting their train data ourselves) and writes to the separate
-`data/output/gretel/gretel_data.jsonl` (not merged into `rm_data.jsonl`). Raw parquet is
-cached (gitignored, ~32MB) under `data/gretel/`.
+### Reward model (`src/walt/rm/model/`)
 
-`gen_training_data.py` now branches per-row on whether `sql_context` is already
-populated: rows without one go through the original full flow (`emit_sql_review`) as
-described above; rows that already have one (gretel) go through a second
-`emit_sql_bad`-only tool call, told not to touch `sql_good`/`sql_context` and just
-generate `sql_bad` against them (`has_context()`/`BAD_ONLY_*` in the module).
-`is_llm_ready()` additionally skips, before either `test` or `submit` spends a call,
-rows whose `sql_context_valid` was already computed `False` at extraction time — bad-only
-mode can't fix those (~532/2200 for gretel, mostly non-SQLite-dialect source schemas).
+`BaseRewardModel` (`base.py`) is algorithm-agnostic: question-level `group_split`
+(splits by `Example`, never by pair, so a question's candidates can't leak across the
+split), `rank()`/`evaluate()` (top-1, pairwise accuracy, MRR) built on a subclass's
+`score(question, sql, sql_context)`, and `cross_validate()`/`k_fold_split()` taking a
+`model_factory` closure (one pre-warmed embedding cache shared across folds, so k-fold
+costs about as much wall-clock as a single split).
 
-**Reward model (`src/walt/rm/model/`)** scores/ranks SQL candidates for a question.
-`BaseRewardModel` (`base.py`) is algorithm-agnostic: question-level train/test split
-(`group_split` — splits by `Example`, never by pair, to avoid leaking a question's
-other candidates across the split), `rank()`/`evaluate()` (top-1 accuracy, pairwise
-accuracy, MRR) built generically on a subclass's `score(question, sql)`, and an
-unused-so-far `predict_error_code()` hook for future subclasses. `LRRewardModel`
-(`lr_model.py`) is the first implementation: scores via `w · phi(question, sql)` where
+`LRRewardModel` (`lr/lr_model.py`) scores `w · phi(question, sql)` where
 `phi = concat(embed(sql), [cosine_sim(embed(question), embed(sql))])`, fit by training
-sklearn `LogisticRegression` on `phi(q,A) - phi(q,B)` differences for
-(`sql_good`, `sql_bad`) pairs (Bradley-Terry style — a per-candidate scorer, not a
-pairwise classifier, so it generalizes to ranking any-size candidate lists). Embeddings
-come from a swappable `EmbeddingProvider` (`embeddings.py`); the default,
-`SentenceTransformerEmbedding`, uses `jinaai/jina-embeddings-v2-base-code` and requires
-`trust_remote_code=True` + the `einops` package. `Example` (`walt/rm/data/base.py`) now
-carries an optional `sql_bad: tuple[SQLBadCandidate, ...]` field for this — defaulted to
-`()` so the data-adapter pipeline is unaffected. `load_examples()` skips and warns on
-rows where `sql_good` duplicates a `sql_bad` entry (~9/987 rows in the current
-`rm_enhanced.jsonl`, a labeling artifact from the LLM data-generation step) rather than
-aborting the load.
+sklearn `LogisticRegression` on `phi(q,A) - phi(q,B)` for candidate pairs (Bradley-Terry
+style — a per-candidate scorer, so it generalizes to any-size candidate lists).
+Embeddings come from a swappable `EmbeddingProvider` (`embeddings.py`); the default is
+`jinaai/jina-embeddings-v2-base-code` (needs `trust_remote_code=True` + `einops`).
+`penalty`/`l1_ratio` are supported via `SOLVER_BY_PENALTY`. Every SQL string is run
+through `walt.utils.sql_exec.normalize_sql` (a sqlglot parse/print round-trip,
+falls back to the original text on a parse error) immediately before it's
+cached/embedded — in `score()`, `fit()`, and `warm_cache()`, so training pairs and
+real inference-time candidates are normalized identically. This closes a formatting
+leak: `sql_good` and `sql_bad` never otherwise shared a text-rendering convention
+(hand-written/gretel-shipped gold vs. sqlglot-rendered corruptions or `llama3.2`'s own
+generation style), so a model could partly learn "which style is this" instead of "is
+this correct." `lr_v7` and `gbm_model.py` override `score()`/`fit()` directly and
+replicate this normalization to stay consistent with the inherited `warm_cache()`;
+every other LR variant inherits `score()`/`warm_cache()` unchanged.
 
-`LRRewardModelV2` (`lr_model_v2.py`) subclasses `LRRewardModel`, overriding only
-`_embed_unique`/`_phi`: V1's `embed()` always L2-normalizes, so its "cosine
-similarity" feature already *is* a dot product (of unit vectors) — V2 fetches raw
-(unnormalized) embeddings instead and adds the raw dot product as a second,
-magnitude-sensitive interaction feature alongside the (now locally-computed) cosine
-similarity (770-dim phi vs V1's 769-dim), with `use_cosine_sim`/`use_dot_product`/
-`standardize_dot_product` constructor flags to ablate each piece. On the real dataset
-none of these combinations beat V1 (confirmed via CV, not just a single split) — the
-raw dot product just isn't informative here, standardized or not.
+Variants (all under `lr/`, re-exported by `walt.rm.model.lr`):
 
-**Establishing a baseline (CV-driven)**: a naive single 80/20 split is too noisy to
-trust small deltas between configs — `cross_validate.py`'s k-fold CV surfaced two real
-improvements a single split had been masking:
-- **Regularization**: sklearn's default `C=1.0` was substantially under-fitting for
-  this data size (~4700 training pairs, 769 features). Sweeping `C` via CV
-  (`cross_validate.py --model lr_v1 --C ...`) showed top1_accuracy climbing
-  monotonically from 0.246 (`C=0.01`) to ~0.47 (`C=10`-`C=30`, tight ±0.005-0.013 std)
-  before diminishing returns and rising variance set in past `C=100` (early overfitting
-  signal). `C=30` is the sweet spot — `LRRewardModel`/`V2`/`V3` all take `C` as a
-  constructor arg (persisted via `save()`/`load()`), and `train.py`/`cross_validate.py`
-  both default to `--C 30`.
-- **`LRRewardModelV3`** (`lr_model_v3.py`) subclasses `LRRewardModel`, appending one
-  handcrafted feature to V1's phi: `is_sql_valid(sql)` (`sql_features.py`, via
-  `sqlglot` — pure syntax parsing, no schema/database needed). Targeted directly at the
-  `syntax_error` mistake category, which was consistently the weakest or
-  second-weakest in every embedding-only variant's `pairwise_accuracy_by_reason`
-  breakdown (~0.70-0.73). Under CV at `C=30`, V3 beats V1 (top1 0.494 vs 0.469); on the
-  full train.py run this shows up concretely as `syntax_error` accuracy jumping from
-  0.73 to 0.89. Note: sqlglot's default dialect treats a lot of unmodeled DDL/DCL
-  (MySQL's `MODIFY COLUMN`, `GRANT`/`REVOKE`, `RENAME TABLE`, ...) as a lenient
-  `Command` fallback instead of raising — `is_sql_valid` treats that fallback as
-  "invalid too" (catches real mistakes like `GRANT ... FROM` that should be `TO`, at
-  the cost of ~0.7% false positives on genuinely-valid `sql_good` DDL); see the
-  docstring in `sql_features.py` for the recall/false-positive numbers this trades off.
-- **`GBMRewardModel`** (`gbm_model.py`) tries a nonlinear model class instead of more
-  features: `sklearn.ensemble.HistGradientBoostingClassifier`, trained *pointwise*
-  (label = is this candidate `sql_good`, features = `phi(question, sql)` directly, no
-  pairwise differencing) rather than pairwise, because a nonlinear model trained on
-  feature *differences* loses the linear-scorer's clean decompose-into-a-per-candidate-
-  score property (see the module docstring for why that matters for ranking an
-  any-size candidate list). It's a strict feature superset of V3 (same phi) — but loses
-  decisively under CV regardless of hyperparameters tried (default and a shallower/
-  fewer-rounds config both land well below plain `lr_v1`, e.g. top1 ~0.36-0.37 vs
-  0.469). Expected, not a bug: gradient-boosted trees split on individual features one
-  at a time, which doesn't suit dense embedding dimensions where the signal is a
-  weighted combination across all ~768 of them — exactly what a linear model is good at
-  and trees are bad at.
+| model | phi | verdict |
+|---|---|---|
+| `lr_v1` | baseline above | superseded |
+| `lr_v2` | + raw (unnormalized) dot product | no gain |
+| `lr_v3` | + `is_sql_valid` (sqlglot syntax check) | strong on synthetic pairs |
+| `lr_v4` | + `cosine_sim(embed(sql_context_clean), embed(sql))` | no gain |
+| `lr_v5` | + full `embed(sql_context)` concat | **structurally inert** — cancels to exactly 0 under pairwise differencing |
+| **`lr_v6`** | v3 + `is_schema_valid` | **default everywhere** |
+| `gbm` | v3 phi, trained *pointwise* | loses decisively |
+| `distilbert` | joint `(context, question, sql)` fine-tune, pairwise loss | never beats `lr_v6`, ~50x cost |
+| `constant` | scores everything `0.0` | ablation baseline — degrades to LLM order |
 
-**Data regeneration: 4-category `sql_bad` taxonomy + held-out `val` split (2026-08-15).**
-`gen_training_data.py`'s `BAD_SQL_REASONS` was replaced wholesale — the old 6 categories
-(`wrong_columns_or_tables`, `wrong_join_or_aggregation`, `wrong_filter_or_sort`,
-`type_or_null_handling`, `syntax_error`, `inefficient_query`) are gone, replaced by 4:
-`missing_filters`, `wrong_aggregation`, `unsafe_patterns`, `misjoined_tables`. Rows also
-now carry `sql_context` (LLM-synthesized SQLite `CREATE TABLE`/`INSERT INTO` statements
-so `sql_good` is actually executable — empty when `sql_good` is itself DDL) and
-`sql_context_valid` (verified locally via `walt/utils/sql_exec.py`'s `run_sql()`, no
-extra API call). `pre_process.py` also now stamps every row with `split`
-(`"trainval"`/`"val"`, via `--val-fraction`) — `val` is a held-out set for agent-level
-evaluation (see below) that `train.py`/`cross_validate.py` filter out before
-`group_split`/`k_fold_split` ever run, rather than changing how those existing
-train/test-within-`trainval` mechanisms work (a single fixed train/test boundary was
-already shown too noisy to trust — see CV discussion above — so only the val/trainval
-boundary is persisted). Regenerating at the same scale as before (`--target-count 1000`,
-same seed → same underlying question/SQL sample) via Anthropic Message Batch: 980/1000
-rows succeeded (20 rejected — the model occasionally omits the now-required
-`sql_context` field instead of returning an empty array; a minor, unfixed
-prompt-robustness gap, ~2% of rows). Of the 980: 836 `trainval` / 144 `val`, and
-`sql_context_valid` passed for 899/980 (91.7%) — the 4 reason categories are reasonably
-balanced (830-1078 `sql_bad` instances each).
+`is_schema_valid(sql, sql_context)` (`sql_features.py`) executes `sql` against the
+schema via `run_sql`, cached on `(sql, sql_context)`. It must be given the **clean,
+data-free** context (`Example.sql_context_clean` — `INSERT`s stripped via
+`clean_context()`), otherwise a data-only constraint violation would look like an
+invalid query. No context at all is treated as valid/neutral. `schema_filter.py`'s
+`SchemaFilteredRewardModel` applies the same check as a hard pre-filter around any model.
 
-**Superseded baseline (spider/dbasql only): `lr_v3` with `C=30`, retrained on the
-regenerated data above** — `top1_accuracy` 0.6587, `pairwise_accuracy` 0.8982, `mrr`
-0.8179 on the standard 80/20 `trainval` split (5-fold CV: 0.6448 ± 0.0303 / 0.8955 ±
-0.0097 / 0.8117 ± 0.0165), with a moderate overfitting gap (+0.078/+0.028/+0.045 — wider
-than the ~+0.02-0.03 seen pre-regeneration, plausibly just a smaller effective
-`trainval` pool: 836 rows vs the old 978). Not directly comparable to the
-pre-regeneration numbers (`top1_accuracy` 0.546, `pairwise_accuracy` 0.864, `mrr` 0.738,
-vs the original untuned `lr_v1` baseline's 0.424/0.811/0.658) — both the `sql_bad`
-taxonomy and the row set changed, not just `C`. See below for the current baseline —
-kept here only as a before/after reference point.
+`SQLBadCandidate.severity` (`int | None`, 0-5, only ever set by
+`enhance_severity_dataset.py`) drives an effective-rank pairing rule in
+`LRRewardModel.fit()`: `sql_good` beats every bad; `severity is None` bads pair only
+against `sql_good` (so all-`None` datasets produce bit-identical training pairs and RNG
+consumption as before the field existed); `severity == 0` bads are excluded entirely;
+`1..5` bads additionally pair against every other `1..5` bad of *different* severity.
+`evaluate()` mirrors this (severity=0 excluded from ranking and pairwise accuracy).
+`--severity-zero-as-positive` is a tested-and-rejected opt-in ablation — keep it off.
+`--ignore-sql-good` is the opposite bet and currently looks like a win: it drops
+`sql_good` from `positive_anchors` entirely and uses *only* `severity==0` bads as the
+positive anchor (forcing `severity_zero_as_positive`'s effect on regardless of its own
+setting), so training never sees Spider's literal gold text — only `llama3.2`'s own
+correct-vs-incorrect distinction. Scores far worse on the RM's own pairwise test but
+reranks real `llama3.2` candidates better than any trained model tried so far — see
+`docs/experiments.md` and "Current state" below. `evaluate()` is unchanged by this
+flag (still ranks against the real `sql_good`), so it isn't directly comparable
+against `--severity-zero-as-positive`'s or the default's CV numbers as "the same test,
+different training" — it's measuring transfer to a held-out ground truth the model
+never trained on.
 
-**Current best baseline: `lr_v3` with `C=1000`, spider/dbasql + gretel combined
-(2026-08-15).** `data/output/rm_enhanced_with_gretel.jsonl` = the 980-row
-`rm_enhanced.jsonl` above plus the 1666-row `gretel_enhanced.jsonl` (gretel data run
-through `gen_training_data.py`'s bad-only mode — see gretel pipeline above), 2646 rows
-total / 2642 usable (4 more hit the same `sql_good`-duplicates-`sql_bad` skip as
-before) — 2355 `trainval` / 291 `val`. On this combined set, `C=30` (tuned on the old,
-smaller `trainval` pool) noticeably *underperforms*: CV-sweeping `C` from 3 to 3000
-(`cross_validate.py --model lr_v3 --C ...`) showed top1_accuracy still climbing well
-past the old sweet spot — 0.542 (`C=3`) → 0.580 (`C=30`) → 0.602 (`C=300`) — before
-plateauing at ~0.60 through `C=3000`, with `C=1000` landing on that plateau at the
-tightest variance by far (top1 0.6006 ± 0.0056, vs ±0.015-0.024 for every other `C`
-tried) — more data supporting much less regularization, as expected. Standard 80/20
-split at `C=1000`: `top1_accuracy` 0.6128, `pairwise_accuracy` 0.8794, `mrr` 0.7877,
-overfitting gap +0.016/+0.013/+0.014 (tighter than the superseded baseline's, despite
-~3x the `trainval` rows — plausibly gretel's added diversity, not just row count).
-**These numbers are lower than the superseded spider/dbasql-only baseline above**
-(0.6587/0.8982/0.8179) despite the re-tuned `C` — confirmed by both CV and the single
-split, so it isn't split noise. Likely cause: gretel spans far more diverse
-domains/schemas per question than spider/dbasql, so `phi`'s embedding-similarity signal
-has more surface area to get confused by; per-category breakdown on the combined set is
-`unsafe_patterns` 0.95, `wrong_aggregation` 0.87, `missing_filters` 0.85,
-`misjoined_tables` 0.84 (weakest, consistent with the superseded baseline). Read this as
-a harder, more realistic baseline rather than a regression to fix — the smaller,
-narrower old dataset was measuring an easier task.
+`tracking.py` (`log_run`/`load_runs`) is shared, algorithm-agnostic run logging, reused
+unchanged by `eval/evaluate.py` against its own `data/output/eval_runs/`.
 
-**Making the RM consume `sql_context` (the schema `sql` executes against) — two things
-tried, neither beats plain `lr_v3` (2026-08-15).** `BaseRewardModel.score()`/`rank()`
-and `LRRewardModel._phi()`/`fit()` now thread an optional `sql_context: tuple[str, ...]`
-through end to end (`evaluate()` passes `ex.sql_context`; `sql_agent.py` passes
-`schema_context`) — plumbing any future context-aware variant needs, kept even though
-neither variant below won:
-- **`LRRewardModelV4`** (`lr_model_v4.py`): appends one scalar,
-  `cosine_sim(embed(sql_context), embed(sql))`, to V3's phi (context embedded once per
-  example, keyed by the joined statement text — see `lr_model_context.py`'s
-  `ContextAwareLRRewardModel`, shared by V4/V5). The feature is real — a fitted
-  coefficient of 1.15 at `C=1000`, not zeroed out — but CV-tied with plain `lr_v3` at
-  every `C` tried (300/1000/3000; e.g. `C=1000` top1 0.5993 ± 0.0196 vs V3's
-  0.6006 ± 0.0056), with consistently *higher* variance than V3 alone. No measurable
-  benefit.
-- **`LRRewardModelV5`** (`lr_model_v5.py`): concatenates the full `embed(sql_context)`
-  vector (not just a scalar) alongside `embed(sql)`. This one isn't a "no signal"
-  result — it's structurally inert. `LRRewardModel.fit()` trains on the *pairwise
-  difference* `phi(q, sql_good) - phi(q, sql_bad)`; `sql_context` is identical across
-  every candidate for a given question, so `embed(sql_context)` cancels to *exactly*
-  zero in every training row regardless of what it encodes. Confirmed directly: the
-  fitted coefficient block for those 768 dims is `0.0` to the last bit, and V5's
-  predictions are byte-identical to V3's on the standard 80/20 split. Concatenating a
-  per-question-constant feature can never contribute a gradient under this
-  pairwise-difference objective — fixing it for real would need either a per-candidate
-  interaction (e.g. `embed(sql_context) * embed(sql)` elementwise, generalizing V4's
-  scalar to a full vector instead of a raw concat) or switching to pointwise training
-  like `GBMRewardModel` (which already underperformed pairwise `lr_v1` here — see
-  below). Left undone; this is documented as a dead end, not attempted further.
+### Agent (`src/walt/agent/`) and evaluation (`src/walt/eval/`)
 
-**Embedding model choice matters more than any single feature/hyperparameter change
-tried so far.** CV-swept `lr_v3`/`C=30` against two general-purpose alternatives —
-`BAAI/bge-base-en-v1.5` (top1 0.372) and `sentence-transformers/all-mpnet-base-v2`
-(top1 0.377) — both landed well below `jina-embeddings-v2-base-code`'s 0.494, and
-close to each other despite being different model families. This is decent evidence
-that `jina-embeddings-v2-base-code`'s code-specific training (query/code retrieval
-alignment) is doing real work here, not just a plausible-sounding default — a generic
-strong text-embedding model isn't a substitute for one that's actually seen code.
+`BaseLLM.generate_candidates(question, schema_context, n)` is the swappable interface;
+`OllamaLLM` is the only implementation. Ollama's HTTP API has no beam-search/multi-return
+parameter, so it makes `n` separate `chat()` calls with varied temperature/seed —
+`BaseLLM`'s signature is backend-agnostic so a `transformers` backend with real
+`num_beams` is a drop-in swap. `max_concurrency` (`--ollama-concurrency`) fires those `n`
+calls through a thread pool, always returning them in seed order; scoped to *within* one
+row so `CachingLLM`'s non-concurrency-safe cache write never sees concurrent writers.
+`CachingLLM` wraps any `BaseLLM` with the disk cache described under Commands.
 
-**Scaling the `embed(sql)` block of phi doesn't help either — same null-result pattern
-as the dot-product scaling test.** `LRRewardModelV3Scaled` (`lr_model_v3_scaled.py`,
-`--scaling` on `cross_validate.py`) ablates how the ~768-dim `embed(sql)` portion of
-phi is scaled before concatenation with `cosine_sim`/`is_sql_valid`, everything else
-identical to the `lr_v3`/`C=30` baseline. `embed(sql)` is already L2-normalized by the
-embedding provider's default (`normalize=True`), so `scaling="l2_normalize"` is a
-no-op by construction and `scaling="l2_normalize_standardize"` collapses to plain
-`scaling="standardize"` — both still implemented and CV-run rather than assumed, and
-the numbers confirm the equivalence empirically (l2_normalize: top1 0.492±0.013 vs
-baseline 0.494±0.014; l2_normalize_standardize: 0.473±0.016 vs standardize-alone:
-0.470±0.014). The one real result: per-dimension standardizing (sklearn
-`StandardScaler`, fit per CV fold on that fold's training data only) *costs* ~2.3pp
-top1 (0.470 vs 0.494) — outside CV noise, not a fluke. Likely explanation: `C=30` was
-CV-tuned against the raw (unnormalized-per-dimension) embedding scale, and
-standardizing changes which dimensions the L2 penalty effectively favors; if a scaling
-scheme were ever adopted, `C` would need re-tuning, but since nothing here beats the
-unscaled baseline that's moot for now. Net: no scaling variant beats the current
-unscaled baseline — keep `embed(sql)` as-is.
+`SqlAgent.run()` generates candidates, calls `rm.rank()`, executes the top pick via
+`utils/sql_exec.py`, and returns an `AgentResult` (`critique` is always `None` — not
+implemented). `sql_exec.execute_with_context(sql_context, sql_context_path, sql)` is the
+single execution entry point: with an embedded context it builds a fresh in-memory DB;
+with a `sql_context_path` it reuses one in-memory connection per path (built by
+`load_context_from_sqlite`, which reads `sqlite_master` + rows directly rather than
+`iterdump()`, whose internal `PRAGMA foreign_key_check` raises on real defects in
+Spider's own DBs) and invalidates it the moment a mutating statement runs, so no
+candidate's side effect leaks into another's result. `evaluate.py` sorts val rows by
+`sql_context_path` to keep that cache warm.
 
-**L1 regularization (vs the default L2) is a promising but unconfirmed lead, not yet a
-win.** `LRRewardModel` (and V2/V3/V3Scaled via inheritance) now take `penalty`/
-`l1_ratio` (`SOLVER_BY_PENALTY = {l2: lbfgs, l1: liblinear, elasticnet: saga}` in
-`lr_model.py`; sklearn requires a non-`lbfgs` solver for L1/elasticnet), exposed as
-`--penalty`/`--l1-ratio` on `cross_validate.py`. Confirmed L1 does genuine feature
-selection first (sklearn 1.8+ emits a `penalty`-is-being-deprecated-in-favor-of-
-`l1_ratio` warning here, but still applies it correctly): a direct fit at `C=30` zeroed
-395/770 coefficients under `penalty=l1` vs 0/770 under `l2`. CV-swept `lr_v3`/`C=30`
-against the `l2` baseline at two seeds — L1 comes out numerically ahead on all 6
-metric comparisons (top1/pairwise/mrr x 2 seeds), a consistent direction, but the
-margin isn't clean: seed=42 shows top1 0.515±0.027 (l1) vs 0.494±0.014 (l2), a gap
-inside roughly one *combined* std since L1's own variance is ~2x L2's there; seed=7
-shows top1 0.509±0.046 (l1) vs 0.498±0.060 (l2), an even smaller gap with both
-penalties noisier (matches the pre-existing seed-7-vs-42 fold-heterogeneity note
-above). Net: not yet a confirmed win — a real, consistently-directional lead worth
-revisiting, not a new baseline. If pursued further, `C` should be re-swept
-specifically for `penalty=l1` (L1's optimal regularization strength isn't guaranteed
-to be the same 30 tuned for L2) — not attempted here to keep this run isolated to
-penalty type alone. The ~50% coefficient sparsity itself could also be a reason to
-prefer L1 independent of the accuracy question (e.g. simpler/faster inference), if
-that becomes a project goal.
+`evaluate.py` runs the agent over held-out `split == "val"` rows and reports: RM
+good-vs-bad accuracy; SQL execution pass rate and end-to-end QA accuracy (row-set match
+against the reference result), each **with and without** RM reranking from the same
+candidates; and an **oracle ceiling** bucketing each row into `all_correct` (nothing to
+rerank), `zero_correct` (unreachable by any reranker — an LLM generation ceiling), and
+`mixed` (the only bucket where selection matters, compared against random-chance
+expectation).
 
-`tracking.py` (`log_run`/`load_runs`) is the shared run-logging mechanism any
-`BaseRewardModel` subclass's training script can reuse — not tied to `LRRewardModel`.
-`visualize.py` reads everything under a runs directory and renders a comparison
-table + line chart (top1_accuracy/pairwise_accuracy/mrr per run, chronological).
-`base.py`'s `cross_validate()`/`k_fold_split()` are similarly algorithm-agnostic (take
-a `model_factory` closure) — shares one pre-warmed embedding cache across all folds
-(embedding a string doesn't depend on which fold it's in) rather than re-embedding
-per fold, so k-fold CV costs about the same wall-clock time as a single split.
+## Conventions
 
-**SQL agent (`src/walt/agent/`)** wires an LLM candidate generator to the RM and a toy
-SQLite executor: `agent/llm/base.py`'s `BaseLLM.generate_candidates(question,
-schema_context, n) -> list[str]` is the swappable interface; `agent/llm/ollama_llm.py`'s
-`OllamaLLM` is the only implementation so far, backed by a local Ollama server. Ollama's
-HTTP API has no beam-search/multi-return (`num_beams`/`n`/`best_of`) parameter, so
-`generate_candidates` makes `n` separate `chat()` calls with varied temperature/seed
-rather than one decode pass — `BaseLLM`'s signature is deliberately backend-agnostic so
-a future `transformers`-based backend with true `num_beams` beam search is a drop-in
-swap for comparison later. `agent/sql_agent.py`'s `SqlAgent.run(question,
-schema_context)` generates candidates, calls `rm.rank()` (the existing
-`BaseRewardModel` method — no new RM code needed) to pick the top-scored one, executes
-it via `walt/utils/sql_exec.py`'s `run_sql()` against a fresh in-memory SQLite DB seeded
-from `schema_context`, and returns an `AgentResult` (`raw_candidates`,
-`scored_candidates`, `best_sql`, `execution`, `final_answer`, and a `critique` field
-that's always `None` — not implemented). `agent/llm/caching_llm.py`'s `CachingLLM`
-wraps any `BaseLLM` with a disk cache (default `data/output/llm_cache.json`) keyed by
-`(model, question, schema_context)` — deliberately *not* keyed by `n`, so a request for
-fewer candidates than cached is served by slicing and only a request for *more*
-triggers a real call — so re-running evaluation against a different RM (retrained,
-different hyperparameters, even a different `BaseRewardModel` subclass) costs zero new
-LLM calls. Enabled by default on both `sql_agent.py`'s CLI and `evaluate.py`
-(`--no-llm-cache` to disable).
+- Long-running Ollama/Claude-loop scripts call `sys.stdout.reconfigure(line_buffering=True)`
+  at the top of `main()` and print periodic progress with a rate/ETA — Python fully
+  buffers stdout when it isn't a TTY, which made a 40+ minute backgrounded run look dead.
+  Do this for any new script of that shape.
+- Raising `OllamaLLM.max_concurrency` alone changes nothing: the `llama-server` Ollama
+  spawns defaults to `-np 1`. Fix system-side with `launchctl setenv OLLAMA_NUM_PARALLEL 4`
+  (a shell `export` doesn't reach Ollama.app), then quit and reopen Ollama.app; verify via
+  `ps aux | grep llama-server`. Restarting kills in-flight requests, so do it between runs.
+- Never silently drop a row: failed LLM validation falls back to the original content and
+  output line count always matches input.
+- Result-set comparison (used by `fix_sql_bad.py` and the QC checks) is blind to
+  non-`SELECT` statements — `run_sql` returns `rows=None`, so two different `UPDATE`s look
+  identical. Restrict any such analysis to `SELECT` rows or state the caveat.
 
-**Agent-level evaluation (`src/walt/eval/evaluate.py`)** runs the agent over the
-held-out `split == "val"` rows (never seen by RM training/CV — see above) and reports
-four things: (1) RM accuracy discriminating `sql_good` vs `sql_bad`, via the existing
-`BaseRewardModel.evaluate()` — no new logic; (2) SQL execution pass/fail, and (3)
-end-to-end QA accuracy (row-set match between the agent's executed result and
-`run_sql(sql_context, sql_good)`'s reference result) — both (2) and (3) reported *with*
-RM reranking (the agent's actual top pick) *and* without it (the first generated
-candidate, i.e. what a single-shot call with no RM would produce), reusing the same
-generated candidates for both so the comparison costs no extra LLM calls; and (4) an
-**oracle ceiling** (added 2026-08-15, previously a one-off ad hoc analysis — now a
-standard part of every run): of the `n_candidates` the LLM generated per question, how
-many actually execute to the correct answer, bucketed per row into `all_correct` (any
-pick wins — nothing to rerank), `zero_correct` (unreachable by *any* reranker — an LLM
-generation-quality ceiling, not an RM problem), and `mixed` (0 < n_correct < n —
-the only bucket where selection quality actually matters). `ceiling` =
-`(all_correct + mixed) / n_qa_examples` is the best any reranker could ever score; within
-`mixed`, the with-RM/without-RM achieved rates are compared against the random-chance
-expectation (`Σ n_correct/n_candidates` over that bucket) so a low achieved number can
-be told apart from "there was nothing to achieve." Reuses `rm_execution`/`base_execution`
-already computed for (2)/(3) instead of re-running identical SQL, so this costs no extra
-LLM calls and only a handful of extra local `run_sql()` calls (up to `n_candidates - 2`
-per row). Each run logs a record to `data/output/eval_runs/` via `rm/model/tracking.py`'s
-`log_run`/`load_runs` (reused as-is — already algorithm-agnostic, not tied to RM
-training) with a flat `metrics` dict (`rm_top1_accuracy`, `sql_pass_rate_with_rm`/
-`_without_rm`, `qa_accuracy_with_rm`/`_without_rm`, `oracle_ceiling` and friends) so
-`eval/visualize.py` — the same table+chart pattern as `rm/model/visualize.py`, one color
-per metric group and solid/dashed linestyle for with/without RM, plus a third dotted
-line for `oracle_ceiling` (no with/without split — it's a property of the LLM's
-candidates, not the reranker) — can track the RM-vs-no-RM gap *and* the ceiling it's
-bounded by across runs over time.
+## Current state (details in [`docs/experiments.md`](docs/experiments.md))
 
-**Finding: the RM does not transfer to `llama3.2`'s candidate distribution
-(2026-08-15).** On the 144-row val set (123 executable rows, `n_candidates=5`),
-RM-reranked and no-rerank-baseline are *tied* on end-to-end QA accuracy — 70/123
-(56.9%) either way — and the RM's pick actually executes successfully slightly *less*
-often than the naive first-candidate baseline (103/123 vs 107/123). This isn't the RM
-quietly doing nothing: it disagrees with the baseline pick on 69/123 (56%) rows, but
-among those disagreements it's an exact 15-15 split on which pick is actually correct
-(39 ties) — when RM changes the answer, it's a coin flip, not an improvement. Likely
-cause: the RM was trained to discriminate `sql_good` from Claude-*synthesized*
-`sql_bad` negatives (four deliberate, clean mistake categories — see above), a
-different error distribution than `llama3.2`'s actual generation mistakes at
-`temperature=0.8`; the discriminative signal doesn't transfer out-of-distribution. Not
-yet fixed — the natural next step is retraining with `llama3.2`'s own wrong candidates
-folded in as `sql_bad`-style negatives, targeting the mismatch directly instead of
-assuming synthetic negatives generalize.
-
-**Oracle ceiling: 77.2% (95/123), vs 56.9% achieved — most of the gap isn't RM's to
-close.** Among the 5 cached `llama3.2` candidates per val question: 41/123 (33%) rows
-have *all 5* candidates correct (any pick wins, nothing to rerank), 28/123 (23%) have
-*zero* correct candidates (unreachable by any reranker — a `llama3.2`
-generation-quality ceiling, not an RM problem), leaving 54/123 (44%) as the "mixed"
-bucket where selection quality actually matters. In that bucket, current achieved
-(29/54) is barely above the ~26.8/54 a purely random pick would be expected to get by
-chance (weighted by how many of the 5 are correct per row) — confirming the RM has
-~no discriminative signal on `llama3.2`'s candidates specifically, consistent with the
-disagreement finding above. Originally a one-off ad hoc analysis; re-run against the
-now-integrated `evaluate.py` oracle-ceiling logic (see above) and reproduced exactly
-(77.2%/41/28/54/29/54), confirming the two methodologies agree.
-
-**Agent baseline on gretel's val split (2026-08-15): the transfer gap is worse here, not
-just present.** Same setup (`n_candidates=5`, `llama3.2`), run against
-`data/output/gretel/gretel_enhanced.jsonl`'s 147 executable val rows with the current
-best RM (`lr_v3`/`C=1000` on the combined dataset — see baseline above). RM accuracy
-(`sql_good` vs `sql_bad`) on this split: top1 0.544 — noticeably below the 0.613 the
-same RM gets on the combined 80/20 split, consistent with gretel being the harder
-subset throughout this file. At the agent level, RM reranking doesn't just fail to
-help as on spider/dbasql (tied) — it actively *hurts* both metrics: SQL execution pass
-131/147 (89.1%) with RM vs 135/147 (91.8%) without, QA accuracy 55/147 (37.4%) with RM
-vs 59/147 (40.1%) without (a ~2.7pp regression each, not noise-sized given the n=147
-sample). Separately, raw QA accuracy here (37-40%) is far below spider/dbasql's ~57%
-regardless of reranking — `llama3.2` itself generates correct SQL far less often for
-gretel's more domain-diverse questions, so this isn't purely an RM transfer problem;
-generation quality is also lower on this harder distribution. Logged to
-`data/output/eval_runs/20260815T235055Z_lr_v3_C1000_with_gretel_on_gretel_val.json`.
-
-Oracle ceiling on this split confirms it's a generation-quality problem more than a
-reranking problem: **51.0% (75/147)**, vs spider/dbasql's 77.2% — a much lower ceiling.
-`zero_correct` is 49.0% (72/147, more than double spider/dbasql's 22.8%) — nearly half
-the val set is unreachable by *any* reranker, `all_correct` is 24.5% (36/147), leaving
-`mixed` at 26.5% (39/147). Within that mixed bucket the pattern from spider/dbasql
-repeats and sharpens: achieved-without-RM (59.0%, 23/39) clearly beats both
-achieved-with-RM (48.7%, 19/39) *and* the random-chance expectation (45.6%, 17.8/39) —
-RM reranking is worse than doing nothing, and only barely better than chance, on
-gretel's candidates specifically.
+- **Default config**: `lr_v6` (`lr_v3` phi + `is_schema_valid`) at `C=0.1`, on the
+  severity-scored synth dataset. `C` dropped from 300 once every SQL string started
+  getting sqlglot-normalized before embedding (see above) — that closed a formatting
+  leak, and the old high-`C` (low-regularization) default started overfitting once it
+  was gone. `C` is tuned per dataset/config — re-sweep it, don't inherit.
+- **Best RM numbers** (honest, post-normalization): severity-scored synth, `lr_v6`/`C=0.1`
+  — top1 0.805 / pairwise 0.9322 / mrr 0.8888 on the standard 80/20 split. (Was
+  0.9225/0.9693/0.9548 at the old `C=300` before normalization — that drop is the leak
+  closing, not a regression; agent-level performance held up, see below.) gretel is
+  still much harder (~0.55-0.60 top1); the deterministic-corruptor synth set still
+  saturates, now at ~0.99 instead of ~1.00.
+- **`is_schema_valid` is still most of the agent-level story, but no longer all of
+  it.** On the severity-scored synth val set: no reranking 72.0% SQL pass / 46.3% QA →
+  `lr_v3` (no schema signal) 70.3% / 45.0% (*worse than not reranking*) → `lr_v6`
+  95.3% / 53.3% → `constant` + `--schema-filter` (zero training, just reject
+  schema-invalid candidates) 95.3% / 56.0% → **`lr_v6` trained with
+  `--ignore-sql-good`** (drops `sql_good` as the training anchor entirely, trains only
+  on `llama3.2`'s own correct-vs-incorrect distinction) **+ `--schema-filter`**
+  stacked on top: 95.3% / **58.3%, the best of every configuration tested, on both
+  metrics simultaneously** — `--ignore-sql-good` alone gets the QA win but narrowly
+  loses SQL pass (94.7%) to the filter baseline; stacking the hard filter on top closes
+  that gap for free (same 58.3% QA, now tied at 95.3% SQL pass too).
+- **The RM does not transfer to `llama3.2`'s candidate distribution without that hard
+  schema check** — reranking was tied on spider/dbasql and actively harmful on
+  gretel/gretel_opus. Schema awareness only pays off as a hard, execution-verified fact:
+  soft embedding proximity to the schema (`lr_v4`) is a null-to-negative result, because a
+  hallucinated column still sits close to the real schema in embedding space.
+- **Open gap, mostly closed**: schema filtering used to have ~no power over semantic
+  mistakes and no trained model beat it on QA accuracy — `--ignore-sql-good` +
+  `--schema-filter` (above) now strictly dominates it. Not yet validated beyond the
+  ollama-only dataset (full severity-scored dataset, gretel, spider/dbasql).
