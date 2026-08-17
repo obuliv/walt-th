@@ -53,8 +53,9 @@ def main() -> None:
     parser.add_argument("--runs-dir", type=Path, default=Path("data/output/runs"), help="Directory where per-run metric records are logged for later comparison")
     parser.add_argument("--no-log-run", action="store_true", help="Skip writing a run record (e.g. for throwaway/debug runs)")
     parser.add_argument("--C", type=float, default=300.0, help="[lr_v1/lr_v2/.../lr_v6 only] LogisticRegression inverse regularization strength — 300 is CV-tuned for lr_v6 on gretel-only data (sklearn's own default is 1.0); other models/datasets were tuned separately, see CLAUDE.md")
-    parser.add_argument("--severity-zero-as-positive", action="store_true", help="[lr_v1/lr_v3/lr_v4/lr_v5/lr_v6/lr_v7 only] treat severity==0 sql_bad candidates (from enhance_severity_dataset.py) as extra positive anchors paired against every real bad, instead of excluding them from every pair. No-op on datasets without severity.")
-    parser.add_argument("--ignore-sql-good", action="store_true", help="[lr_v1/lr_v3/lr_v4/lr_v5/lr_v6/lr_v7 only] drop sql_good from positive_anchors entirely and use ONLY severity==0 sql_bad candidates as the positive anchor (forces severity_zero_as_positive's effect on regardless of its own flag). A row with no severity==0 candidate contributes zero good-vs-bad pairs (its ranked-bad-vs-ranked-bad pairs, if any, are unaffected). evaluate() is unchanged — still ranks against the real sql_good.")
+    parser.add_argument("--severity-zero-as-positive", action="store_true", help="[lr_v1/lr_v3/lr_v4/lr_v5/lr_v6/lr_v7/distilbert only] treat severity==0 sql_bad candidates (from enhance_severity_dataset.py) as extra positive anchors paired against every real bad, instead of excluding them from every pair. No-op on datasets without severity.")
+    parser.add_argument("--ignore-sql-good", action="store_true", help="[lr_v1/lr_v3/lr_v4/lr_v5/lr_v6/lr_v7/distilbert only] drop sql_good from positive_anchors entirely and use ONLY severity==0 sql_bad candidates as the positive anchor (forces severity_zero_as_positive's effect on regardless of its own flag). A row with no severity==0 candidate contributes zero good-vs-bad pairs (its ranked-bad-vs-ranked-bad pairs, if any, are unaffected). evaluate() is unchanged — still ranks against the real sql_good.")
+    parser.add_argument("--drop-bad-vs-bad-pairs", action="store_true", help="[lr_v1/lr_v3/lr_v4/lr_v5/lr_v6/lr_v7/distilbert only] drop the ranked-bad-vs-ranked-bad pairs (e.g. severity 3 vs. severity 2) entirely, keeping only pairs with a positive_anchor (sql_good or a severity==0 bad) on one side. Tests whether graded-severity pairs add signal beyond correct-vs-incorrect.")
     parser.add_argument("--embedding-diff-mode", choices=EMBEDDING_DIFF_MODES, default="cosine", help="[lr_v7 only] how the commands/args-vs-question embedding comparison is folded into phi: 'cosine' (2 scalar cosine similarities) or 'raw' (2x768 raw vector differences)")
     parser.add_argument("--v7-schema-valid", dest="v7_schema_valid", action="store_true", help="[lr_v7 only] append is_schema_valid(sql, sql_context) to phi_v7 (V7 excludes it by default, unlike lr_v6)")
     parser.add_argument("--v2-cosine-sim", dest="v2_cosine_sim", action=argparse.BooleanOptionalAction, default=True, help="[lr_v2 only] include the cosine-similarity interaction feature")
@@ -91,7 +92,7 @@ def main() -> None:
         None if args.model == "distilbert" else SentenceTransformerEmbedding(model_name=args.embedding_model, device=args.device)
     )
     if args.model == "lr_v1":
-        model = LRRewardModel(embedding_provider=embedding_provider, seed=args.seed, C=args.C, severity_zero_as_positive=args.severity_zero_as_positive, ignore_sql_good=args.ignore_sql_good)
+        model = LRRewardModel(embedding_provider=embedding_provider, seed=args.seed, C=args.C, severity_zero_as_positive=args.severity_zero_as_positive, ignore_sql_good=args.ignore_sql_good, drop_bad_vs_bad_pairs=args.drop_bad_vs_bad_pairs)
     elif args.model == "lr_v2":
         model = LRRewardModelV2(
             embedding_provider=embedding_provider,
@@ -102,13 +103,13 @@ def main() -> None:
             standardize_dot_product=args.v2_standardize_dot,
         )
     elif args.model == "lr_v3":
-        model = LRRewardModelV3(embedding_provider=embedding_provider, seed=args.seed, C=args.C, severity_zero_as_positive=args.severity_zero_as_positive, ignore_sql_good=args.ignore_sql_good)
+        model = LRRewardModelV3(embedding_provider=embedding_provider, seed=args.seed, C=args.C, severity_zero_as_positive=args.severity_zero_as_positive, ignore_sql_good=args.ignore_sql_good, drop_bad_vs_bad_pairs=args.drop_bad_vs_bad_pairs)
     elif args.model == "lr_v4":
-        model = LRRewardModelV4(embedding_provider=embedding_provider, seed=args.seed, C=args.C, severity_zero_as_positive=args.severity_zero_as_positive, ignore_sql_good=args.ignore_sql_good)
+        model = LRRewardModelV4(embedding_provider=embedding_provider, seed=args.seed, C=args.C, severity_zero_as_positive=args.severity_zero_as_positive, ignore_sql_good=args.ignore_sql_good, drop_bad_vs_bad_pairs=args.drop_bad_vs_bad_pairs)
     elif args.model == "lr_v5":
-        model = LRRewardModelV5(embedding_provider=embedding_provider, seed=args.seed, C=args.C, severity_zero_as_positive=args.severity_zero_as_positive, ignore_sql_good=args.ignore_sql_good)
+        model = LRRewardModelV5(embedding_provider=embedding_provider, seed=args.seed, C=args.C, severity_zero_as_positive=args.severity_zero_as_positive, ignore_sql_good=args.ignore_sql_good, drop_bad_vs_bad_pairs=args.drop_bad_vs_bad_pairs)
     elif args.model == "lr_v6":
-        model = LRRewardModelV6(embedding_provider=embedding_provider, seed=args.seed, C=args.C, severity_zero_as_positive=args.severity_zero_as_positive, ignore_sql_good=args.ignore_sql_good)
+        model = LRRewardModelV6(embedding_provider=embedding_provider, seed=args.seed, C=args.C, severity_zero_as_positive=args.severity_zero_as_positive, ignore_sql_good=args.ignore_sql_good, drop_bad_vs_bad_pairs=args.drop_bad_vs_bad_pairs)
     elif args.model == "lr_v7":
         model = LRRewardModelV7(
             embedding_provider=embedding_provider,
@@ -116,6 +117,7 @@ def main() -> None:
             C=args.C,
             severity_zero_as_positive=args.severity_zero_as_positive,
             ignore_sql_good=args.ignore_sql_good,
+            drop_bad_vs_bad_pairs=args.drop_bad_vs_bad_pairs,
             embedding_diff_mode=args.embedding_diff_mode,
             include_schema_valid=args.v7_schema_valid,
         )
@@ -134,6 +136,9 @@ def main() -> None:
             val_fraction=args.distilbert_val_fraction,
             early_stop_patience=args.distilbert_early_stop_patience,
             early_stop_metric=args.distilbert_early_stop_metric,
+            ignore_sql_good=args.ignore_sql_good,
+            severity_zero_as_positive=args.severity_zero_as_positive,
+            drop_bad_vs_bad_pairs=args.drop_bad_vs_bad_pairs,
         )
     else:
         model = GBMRewardModel(
@@ -195,8 +200,9 @@ def main() -> None:
                     {
                         "severity_zero_as_positive": args.severity_zero_as_positive,
                         "ignore_sql_good": args.ignore_sql_good,
+                        "drop_bad_vs_bad_pairs": args.drop_bad_vs_bad_pairs,
                     }
-                    if args.model in ("lr_v1", "lr_v3", "lr_v4", "lr_v5", "lr_v6", "lr_v7")
+                    if args.model in ("lr_v1", "lr_v3", "lr_v4", "lr_v5", "lr_v6", "lr_v7", "distilbert")
                     else {}
                 ),
                 **(

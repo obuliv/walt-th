@@ -63,6 +63,7 @@ class LRRewardModelV7(LRRewardModelV3):
         l1_ratio: Optional[float] = None,
         severity_zero_as_positive: bool = False,
         ignore_sql_good: bool = False,
+        drop_bad_vs_bad_pairs: bool = False,
         embedding_diff_mode: str = "cosine",
         include_schema_valid: bool = False,
     ):
@@ -76,6 +77,7 @@ class LRRewardModelV7(LRRewardModelV3):
             l1_ratio=l1_ratio,
             severity_zero_as_positive=severity_zero_as_positive,
             ignore_sql_good=ignore_sql_good,
+            drop_bad_vs_bad_pairs=drop_bad_vs_bad_pairs,
         )
         self.embedding_diff_mode = embedding_diff_mode
         self.include_schema_valid = include_schema_valid
@@ -141,6 +143,7 @@ class LRRewardModelV7(LRRewardModelV3):
             "l1_ratio": self.l1_ratio,
             "severity_zero_as_positive": self.severity_zero_as_positive,
             "ignore_sql_good": self.ignore_sql_good,
+            "drop_bad_vs_bad_pairs": self.drop_bad_vs_bad_pairs,
             "embedding_diff_mode": self.embedding_diff_mode,
             "include_schema_valid": self.include_schema_valid,
             "embedding_config": self.embedding_provider.config,
@@ -159,6 +162,7 @@ class LRRewardModelV7(LRRewardModelV3):
             l1_ratio=payload.get("l1_ratio"),
             severity_zero_as_positive=payload.get("severity_zero_as_positive", False),
             ignore_sql_good=payload.get("ignore_sql_good", False),
+            drop_bad_vs_bad_pairs=payload.get("drop_bad_vs_bad_pairs", False),
             embedding_diff_mode=payload.get("embedding_diff_mode", "cosine"),
             include_schema_valid=payload.get("include_schema_valid", False),
         )

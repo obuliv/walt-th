@@ -40,6 +40,7 @@ class LRRewardModel(BaseRewardModel):
         l1_ratio: Optional[float] = None,
         severity_zero_as_positive: bool = False,
         ignore_sql_good: bool = False,
+        drop_bad_vs_bad_pairs: bool = False,
     ):
         if penalty not in SOLVER_BY_PENALTY:
             raise ValueError(f"penalty must be one of {sorted(SOLVER_BY_PENALTY)}, got {penalty!r}")
@@ -72,6 +73,13 @@ class LRRewardModel(BaseRewardModel):
         # ex.sql_good) so headline metrics stay comparable across every other run in
         # this file — this only changes what fit() treats as ground truth.
         self.ignore_sql_good = ignore_sql_good
+        # Ablation flag (default off): when True, fit() drops the ranked-bad-vs-
+        # ranked-bad pairs entirely (e.g. severity 3 vs. severity 2) — every remaining
+        # pair then has a positive_anchor (sql_good or a severity==0 bad) on one side,
+        # so the model only ever learns "correct vs. incorrect", never "more vs. less
+        # wrong". Tests whether those graded-severity pairs add real signal or just
+        # noise on top of the anchor-vs-bad pairs.
+        self.drop_bad_vs_bad_pairs = drop_bad_vs_bad_pairs
         self.coef_: Optional[np.ndarray] = None  # shape (dim + 1,)
         self._question_cache: dict[str, np.ndarray] = {}
         self._sql_cache: dict[str, np.ndarray] = {}
@@ -139,7 +147,9 @@ class LRRewardModel(BaseRewardModel):
             # result as sql_good" — excluded from every pair, good-vs-bad or
             # bad-vs-bad, since a tied pair has no learnable signal. severity in 1..5
             # bads are additionally paired against each other whenever their severity
-            # differs (equal-severity pairs are skipped for the same no-signal reason).
+            # differs (equal-severity pairs are skipped for the same no-signal reason),
+            # unless drop_bad_vs_bad_pairs is set (see __init__), in which case every
+            # remaining pair has a positive_anchor on one side.
             none_bads = [b for b in ex.sql_bad if b.severity is None]
             ranked_bads = [b for b in ex.sql_bad if b.severity is not None and b.severity > 0]
             # severity_zero_as_positive (default off — see __init__): when on, every
@@ -157,12 +167,13 @@ class LRRewardModel(BaseRewardModel):
                     pairs.append((anchor, normalize_sql(b.sql)))
                 for b in ranked_bads:
                     pairs.append((anchor, normalize_sql(b.sql)))
-            for i, b1 in enumerate(ranked_bads):
-                for b2 in ranked_bads[i + 1 :]:
-                    if b1.severity == b2.severity:
-                        continue
-                    better, worse = (b1, b2) if b1.severity < b2.severity else (b2, b1)
-                    pairs.append((normalize_sql(better.sql), normalize_sql(worse.sql)))
+            if not self.drop_bad_vs_bad_pairs:
+                for i, b1 in enumerate(ranked_bads):
+                    for b2 in ranked_bads[i + 1 :]:
+                        if b1.severity == b2.severity:
+                            continue
+                        better, worse = (b1, b2) if b1.severity < b2.severity else (b2, b1)
+                        pairs.append((normalize_sql(better.sql), normalize_sql(worse.sql)))
 
             for better_sql, worse_sql in pairs:
                 if rng.random() < 0.5:
@@ -211,6 +222,7 @@ class LRRewardModel(BaseRewardModel):
             "lr_n_zero_coefs": n_zero_coefs,  # implicit feature selection under L1/elasticnet; always 0 under L2
             "severity_zero_as_positive": self.severity_zero_as_positive,
             "ignore_sql_good": self.ignore_sql_good,
+            "drop_bad_vs_bad_pairs": self.drop_bad_vs_bad_pairs,
             "embed_seconds": round(embed_seconds, 3),
             "fit_seconds": round(fit_seconds, 3),
         }
@@ -238,6 +250,7 @@ class LRRewardModel(BaseRewardModel):
             "l1_ratio": self.l1_ratio,
             "severity_zero_as_positive": self.severity_zero_as_positive,
             "ignore_sql_good": self.ignore_sql_good,
+            "drop_bad_vs_bad_pairs": self.drop_bad_vs_bad_pairs,
             "embedding_config": self.embedding_provider.config,
         }
         joblib.dump(payload, path)
@@ -254,6 +267,7 @@ class LRRewardModel(BaseRewardModel):
             l1_ratio=payload.get("l1_ratio"),
             severity_zero_as_positive=payload.get("severity_zero_as_positive", False),
             ignore_sql_good=payload.get("ignore_sql_good", False),
+            drop_bad_vs_bad_pairs=payload.get("drop_bad_vs_bad_pairs", False),
         )
         model.coef_ = payload["coef"]
         return model

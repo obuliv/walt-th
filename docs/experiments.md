@@ -1305,3 +1305,92 @@ which `lr_*` variant, bigger than which extra features, bigger than the hard fil
 alone. Artifacts: `data/output/rm_model_ollamaonly_lr_v7_schemavalid_ignoresqlgood_C10.joblib`,
 `data/output/eval_ollamaonly_lr_v7_schemavalid_ignoresqlgood_C10_schemafilter.json`,
 logged as `ollamaonly_lr_v7_schemavalid_ignoresqlgood_C10_{train,schemafilter_eval}`.
+
+**Dropping the graded-severity bad-vs-bad pairs (severity 3 vs. 2, 4 vs. 2, etc.) on
+top of `ignore_sql_good` edges out the previous best config — a new top result, though
+the margin is small enough to be noise (2026-08-17).** New `LRRewardModel` constructor
+flag `drop_bad_vs_bad_pairs` (threaded through `lr_v1`/`v3`/`v4`/`v5`/`v6`/`v7`,
+persisted in `save()`/`load()`, exposed as `--drop-bad-vs-bad-pairs` on
+`train.py`/`cross_validate.py`): when set, `fit()` skips the pairing loop that pits
+two `severity in 1..5` bads against each other whenever their severities differ,
+leaving only pairs where one side is a `positive_anchor` (`sql_good` or, under
+`ignore_sql_good`, a `severity==0` bad). The question this tests: do those
+graded-severity pairs ("this is a *worse* mistake than that one") teach the model
+anything a real deployment can use, or is "correct vs. incorrect" the only
+distinction that actually transfers? Combined with `ignore_sql_good` on the
+ollama-only dataset (same setup as the entry above, just with this flag added), a
+`C`-sweep (0.1/1/10/30) plateaus almost immediately — pairwise 0.8140 (`C=0.1`) →
+0.8258 (`C=1`) → 0.8310 (`C=10`) → 0.8314 (`C=30`, picked, but statistically
+indistinguishable from `C=10`) — and lands far below `ignore_sql_good`-with-pairs' own
+best (`pairwise` 0.8374 at `C=10` on the identical dataset, see above): removing those
+pairs shrinks the training set enough (roughly half the pairs, since every row's
+severity-1..5 bads no longer pair against each other) that the model has strictly less
+to learn from by its own metric. Agent-level, though, it's at least as good, arguably
+a hair better: SQL pass 286/300 (95.3%, tied with every other filtered config), QA
+accuracy **177/300 (59.0%)**, mixed-bucket achieved 129/156 (82.7%) — vs.
+`ignore_sql_good`+filter's own 175/300 (58.3%) and 127/156 (81.4%). Same "scores worse
+on its own pairwise test, reranks better in practice" pattern `ignore_sql_good` itself
+showed relative to the `sql_good`-anchored default: whatever the graded-severity pairs
+teach the model about relative badness doesn't seem to be information a real
+`llama3.2` candidate distribution rewards at inference time. Caveat: +2/300 rows is a
+small enough delta that it could plausibly be noise rather than a real effect — worth
+re-running with a different seed or on the full (non-ollama-only) severity dataset
+before treating this as the new default. Current full ranking on the ollama-only val
+set (all filtered where noted):
+
+| config | SQL pass | QA accuracy |
+|---|---|---|
+| `lr_v6` + `ignore_sql_good` + `drop_bad_vs_bad_pairs` + filter | 95.3% | **59.0%** |
+| `lr_v6` + `ignore_sql_good` + filter | 95.3% | 58.3% |
+| `lr_v7` + `is_schema_valid` + `ignore_sql_good` + filter | 95.3% | 57.0% |
+| `constant` + filter (no training at all) | 95.3% | 56.0% |
+| `lr_v7`, schema-valid-only training, + filter | 95.3% | 54.3% |
+| `lr_v7` + `is_schema_valid` (no `ignore_sql_good`) + filter | 95.3% | 53.7% |
+| `lr_v6` default (`sql_good`-anchored) | 90.7% | 53.3% |
+| `lr_v7`, schema-valid-only training, no filter | 71.7% | 44.0% (below no-rerank) |
+
+Artifacts (a new top-level `runs/` directory, not `data/output/` — see
+`scripts/build_best_rm.sh`/`scripts/evaluate_best.sh`): `runs/ablation_drop_bad_vs_bad/rm_model.joblib`,
+`runs/ablation_drop_bad_vs_bad/rm_metrics.json`, `runs/ablation_drop_bad_vs_bad/eval_results.json`
+(trained model), `runs/ablation_drop_bad_vs_bad/eval_baseline_constant_schemafilter.json`
+(filter-only baseline, byte-identical to the `ignore_sql_good` entry's own baseline —
+same dataset, same LLM cache), C-sweep + train logs under
+`runs/ablation_drop_bad_vs_bad/runs/`, eval logs under
+`runs/ablation_drop_bad_vs_bad/eval_runs/`.
+
+**DistilBERT under the identical `ignore_sql_good`+`drop_bad_vs_bad_pairs`+ollama-only
+setup: clearly weaker on its own held-out discrimination, but — after `--schema-filter`
+— lands within 0.7pp QA of `lr_v6` on the same 300-row val set (2026-08-17).**
+`build_pairs()` (`distilbert_model.py`, previously always sql_good-vs-every-bad,
+ignoring severity entirely) now takes the same `ignore_sql_good`/
+`severity_zero_as_positive`/`drop_bad_vs_bad_pairs` flags as `LRRewardModel.fit()`,
+with the identical pairing rule (verified pair-for-pair against `lr_model.py`'s output
+on a synthetic example) and the same backward-compatibility guarantee (all-`None`
+severity + every flag off reproduces the exact old pairs/rng draws). Threaded through
+`train.py`'s `--ignore-sql-good`/`--severity-zero-as-positive`/`--drop-bad-vs-bad-pairs`
+(now `[..., distilbert only]` too) and persisted in `save()`/`load()`'s
+`hyperparams` dict. This shrinks the training set sharply — `distilbert_preflight.py`'s
+time estimate (which uses default, unflagged pairing) assumed 8,725 train pairs; the
+actual flagged run had only 3,554 — so a full run finishes far faster than the
+preflight's naive estimate suggests. Early-stopped after 6 epochs (best epoch 3,
+patience 3): held-out (val split) `top1_accuracy` **0.6167**, `pairwise_accuracy`
+**0.7756** — clearly behind `lr_v6`'s own numbers on the identical val split/config
+(top1 0.7367, pairwise 0.8678) and close to chance on `top1` specifically. Agent-level,
+with `--schema-filter` (SQL pass tied at 286/300, 95.3%, same as every filtered
+config): QA accuracy **175/300 (58.3%)**, mixed-bucket achieved **127/156 (81.4%)** —
+vs. `lr_v6`'s 177/300 (59.0%) / 129/156 (82.7%) on the exact same val rows, same
+candidates (shared LLM cache). Despite scoring meaningfully worse on its own
+discrimination test, DistilBERT nearly matches `lr_v6` at the agent level and still
+clearly beats `constant`+filter (168/300, 56.0%) — the same "self-reported pairwise
+accuracy doesn't predict agent-level transfer" pattern seen throughout this file,
+now shown to hold even across model *families*, not just training-anchor choices.
+Doesn't overturn CLAUDE.md's "never beats `lr_v6`" verdict (it still loses, on both
+metrics, at ~50x the training cost) but the margin is much narrower here than in
+earlier DistilBERT entries — plausibly because `--schema-filter` does most of the
+heavy lifting regardless of which model sits underneath it, leaving less room for the
+better-discriminating model to pull ahead. Artifacts:
+`runs/ablation_drop_bad_vs_bad/rm_model_distilbert.pt`,
+`runs/ablation_drop_bad_vs_bad/rm_metrics_distilbert.json`,
+`runs/ablation_drop_bad_vs_bad/eval_results_distilbert.json`, logged as
+`ablation_drop_bad_vs_bad_distilbert_{train,eval}` in
+`runs/ablation_drop_bad_vs_bad/runs/`/`runs/ablation_drop_bad_vs_bad/eval_runs/`.
