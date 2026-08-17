@@ -33,6 +33,8 @@ import json
 import os
 import random
 import sqlite3
+import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -82,6 +84,45 @@ def _is_select_shaped(sql: str) -> bool:
         return False
 
 
+PROGRESS_INTERVAL = 10  # print a status line every N rows -- this stage's real work
+# (one Ollama call per candidate) is slow enough (~1-2s/row) that per-DB-only progress
+# (the pre-existing "db_id: N/M verified" print, once a whole DB finishes) can go
+# silent for tens of minutes on a low-DB-count run. Combined with main()'s
+# sys.stdout.reconfigure(line_buffering=True), these lines are visible in real time
+# even when this script's stdout is redirected to a file (e.g. a backgrounded run) --
+# Python fully buffers stdout by default when it isn't a TTY, so without that fix nothing
+# would appear until the process exits regardless of how often we print.
+
+
+class ProgressTracker:
+    """Tracks rows completed against the total pairs this pool will actually attempt
+    (sum of every selected DB's verified pair count) -- NOT --train-count/--val-count
+    directly, since select_dbs_for_target can (and typically does) accumulate more
+    verified pairs than the target before build_pool downsamples at the very end."""
+
+    def __init__(self, pool_name: str, total: int, interval: int = PROGRESS_INTERVAL):
+        self.pool_name = pool_name
+        self.total = total
+        self.interval = interval
+        self.done = 0
+        self.start = time.perf_counter()
+
+    def step(self) -> None:
+        self.done += 1
+        if self.done % self.interval != 0 and self.done != self.total:
+            return
+        elapsed = time.perf_counter() - self.start
+        rate_per_min = self.done / elapsed * 60 if elapsed > 0 else 0.0
+        remaining = self.total - self.done
+        eta_min = remaining / rate_per_min if rate_per_min > 0 else float("inf")
+        pct = 100 * self.done / self.total if self.total else 100.0
+        print(
+            f"  [{self.pool_name}] {self.done}/{self.total} rows ({pct:.1f}%) | "
+            f"{rate_per_min:.1f} rows/min | elapsed {elapsed / 60:.1f}min | "
+            f"ETA ~{eta_min:.0f}min"
+        )
+
+
 def generate_llama_bad_candidates(
     sql_good: str,
     question: str,
@@ -129,6 +170,7 @@ def build_for_db(
     split: str,
     llm: BaseLLM,
     n_ollama: int,
+    progress: ProgressTracker,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """conn is the already-open, fully-loaded connection select_dbs_for_target built for
     this DB (reused here for every candidate's verify_candidate check instead of
@@ -156,6 +198,7 @@ def build_for_db(
                 "sql_bad": sql_bad,
             }
         )
+        progress.step()
     return rows, annotated_ddl
 
 
@@ -180,13 +223,15 @@ def build_pool(
         print(f"  {c.db_id:<28}{c.table_count:>7}{c.fk_count:>5}{c.fk_density:>9.2f}{c.pair_count:>7}")
 
     selected = select_dbs_for_target(candidates, pairs_by_db, target)
+    total_attempted = sum(len(verified) for _, verified, _, _ in selected)
 
     rows: list[dict[str, Any]] = []
     schemas: dict[str, list[str]] = {}
-    print(f"\n{pool_name} pool selected DBs (target {target}):")
+    print(f"\n{pool_name} pool selected DBs (target {target}, {total_attempted} pairs to attempt):")
+    progress = ProgressTracker(pool_name, total_attempted)
     for db_candidate, verified, _context, conn in selected:
         try:
-            db_rows, annotated_ddl = build_for_db(db_candidate, verified, conn, split, llm, n_ollama)
+            db_rows, annotated_ddl = build_for_db(db_candidate, verified, conn, split, llm, n_ollama, progress)
         finally:
             conn.close()
         print(f"  {db_candidate.db_id}: {len(db_rows)}/{db_candidate.pair_count} verified")
@@ -234,6 +279,12 @@ def write_qc_report(rows: list[dict[str, Any]], output_path: Path) -> None:
 
 
 def main() -> None:
+    # Python fully buffers stdout by default whenever it isn't a TTY (e.g. redirected
+    # to a file, as happens for a backgrounded run) -- without this, every print()
+    # below (including ProgressTracker's) sits in a buffer and never reaches the log
+    # until the process exits, making a multi-hour run look silently stuck.
+    sys.stdout.reconfigure(line_buffering=True)
+
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--spider-dir", type=Path, default=SPIDER_DIR_DEFAULT)
     parser.add_argument("--train-count", type=int, default=2000, help="Verified pairs to sample -> split=trainval")
@@ -247,6 +298,30 @@ def main() -> None:
     parser.add_argument("--ollama-model", default="llama3.2")
     parser.add_argument(
         "--n-ollama-candidates", type=int, default=5, help="How many llama3.2 candidates to generate per row"
+    )
+    parser.add_argument(
+        "--ollama-concurrency",
+        type=int,
+        default=1,
+        help=(
+            "Concurrent Ollama requests per row's candidate generation (default 1 = "
+            "sequential, today's behavior). Raising this ONLY helps once the Ollama "
+            "server itself is configured to accept concurrent requests -- by default "
+            "(and commonly even after a fresh install) Ollama's backend runs with a "
+            "single request slot (llama.cpp's `-np 1`), so client-side concurrency "
+            "alone just queues at the server with no speedup. To actually parallelize: "
+            "(1) quit Ollama completely (menu bar icon -> Quit Ollama, or `killall "
+            "Ollama; killall ollama` in a terminal -- this WILL interrupt any Ollama "
+            "call in flight, including a currently-running instance of this script); "
+            "(2) run `launchctl setenv OLLAMA_NUM_PARALLEL 4` (or another value) so "
+            "the GUI app picks up the env var on next launch -- a plain shell `export` "
+            "won't reach it, since Ollama.app isn't launched from your shell; (3) "
+            "reopen Ollama; (4) verify via `ps aux | grep llama-server` that the "
+            "relaunched process shows `-np 4` (or your chosen value) instead of `-np "
+            "1`; (5) re-run this script with e.g. --ollama-concurrency 4. Memory is "
+            "the real ceiling, not this flag -- each concurrent slot needs its own "
+            "KV-cache allocation, so don't set this far above OLLAMA_NUM_PARALLEL."
+        ),
     )
     parser.add_argument(
         "--llm-cache",
@@ -268,7 +343,7 @@ def main() -> None:
                 print(f"  {c.db_id:<28}{c.table_count:>7}{c.fk_count:>5}{c.fk_density:>9.2f}{c.pair_count:>7}")
         return
 
-    llm: BaseLLM = OllamaLLM(model=args.ollama_model)
+    llm: BaseLLM = OllamaLLM(model=args.ollama_model, max_concurrency=args.ollama_concurrency)
     if not args.no_llm_cache:
         llm = CachingLLM(llm, cache_path=args.llm_cache)
 

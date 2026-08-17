@@ -700,6 +700,12 @@ def cmd_collect(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
+    # See build_severity_dataset.py's main() for why this matters: stdout is fully
+    # buffered by default when redirected to a file (e.g. a backgrounded run), so
+    # progress prints (per-row in test mode, per-poll in collect mode) wouldn't be
+    # visible until the process exits without this.
+    sys.stdout.reconfigure(line_buffering=True)
+
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     subparsers = parser.add_subparsers(dest="command", required=True)
 

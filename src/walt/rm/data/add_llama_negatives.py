@@ -34,6 +34,8 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -79,8 +81,14 @@ def llama_negatives_for_row(llm: BaseLLM, record: dict[str, Any], n_candidates: 
     return new_bad
 
 
+PROGRESS_INTERVAL = 10  # a status line every N trainval rows -- each row costs a real
+# Ollama call, slow enough that silent per-row progress can look stuck on a long run.
+
+
 def process(records: list[dict[str, Any]], llm: BaseLLM, n_candidates: int) -> tuple[list[dict[str, Any]], dict[str, int]]:
     stats = {"trainval_rows": 0, "rows_touched": 0, "candidates_added": 0, "candidates_ignored": 0}
+    n_trainval_total = sum(1 for r in records if r.get("split") == "trainval")
+    start = time.perf_counter()
     output = []
     for record in records:
         if record.get("split") != "trainval":
@@ -90,27 +98,43 @@ def process(records: list[dict[str, Any]], llm: BaseLLM, n_candidates: int) -> t
         new_bad = llama_negatives_for_row(llm, record, n_candidates)
         if not new_bad:
             output.append(record)
-            continue
-        stats["rows_touched"] += 1
-        stats["candidates_added"] += len(new_bad)
-        merged = dict(record)
-        merged["sql_bad"] = list(record.get("sql_bad", [])) + new_bad
-        output.append(merged)
+        else:
+            stats["rows_touched"] += 1
+            stats["candidates_added"] += len(new_bad)
+            merged = dict(record)
+            merged["sql_bad"] = list(record.get("sql_bad", [])) + new_bad
+            output.append(merged)
+        done = stats["trainval_rows"]
+        if done % PROGRESS_INTERVAL == 0 or done == n_trainval_total:
+            elapsed = time.perf_counter() - start
+            rate_per_min = done / elapsed * 60 if elapsed > 0 else 0.0
+            eta_min = (n_trainval_total - done) / rate_per_min if rate_per_min > 0 else float("inf")
+            print(
+                f"  {done}/{n_trainval_total} trainval rows ({100 * done / n_trainval_total:.1f}%) | "
+                f"{rate_per_min:.1f} rows/min | elapsed {elapsed / 60:.1f}min | ETA ~{eta_min:.0f}min"
+            )
     return output, stats
 
 
 def main() -> None:
+    # See build_severity_dataset.py's main() for why this matters: stdout is fully
+    # buffered by default when redirected to a file (e.g. a backgrounded run), so
+    # process()'s progress prints wouldn't be visible until the process exits without
+    # this.
+    sys.stdout.reconfigure(line_buffering=True)
+
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--input", type=Path, default=Path("data/output/gretel/gretel_enhanced_fixed.jsonl"))
     parser.add_argument("--output", type=Path, default=Path("data/output/gretel/gretel_enhanced_fixed_llama.jsonl"))
     parser.add_argument("--n-candidates", type=int, default=3, help="How many llama3.2 candidates to generate per trainval row")
     parser.add_argument("--ollama-model", default="llama3.2")
+    parser.add_argument("--ollama-concurrency", type=int, default=1, help="Concurrent Ollama requests per row's candidate generation. Only helps once the Ollama server itself accepts concurrent requests (see build_severity_dataset.py docstring) — otherwise pure overhead.")
     parser.add_argument("--limit", type=int, default=None, help="Only process the first N trainval rows (sanity check before a full run)")
     parser.add_argument("--llm-cache", type=Path, default=Path("data/output/llm_cache.json"), help="Same cache sql_agent.py/evaluate.py use, keyed by (model, question, schema_context) — reuses candidates instead of re-calling Ollama")
     parser.add_argument("--no-llm-cache", action="store_true")
     args = parser.parse_args()
 
-    llm: BaseLLM = OllamaLLM(model=args.ollama_model)
+    llm: BaseLLM = OllamaLLM(model=args.ollama_model, max_concurrency=args.ollama_concurrency)
     if not args.no_llm_cache:
         llm = CachingLLM(llm, cache_path=args.llm_cache)
 

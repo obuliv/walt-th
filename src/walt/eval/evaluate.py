@@ -24,6 +24,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
+import time
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -34,15 +36,17 @@ from walt.rm.model.constant_model import ConstantRewardModel
 from walt.rm.model.distilbert_model import DistilBertRewardModel
 from walt.rm.model.embeddings import SentenceTransformerEmbedding
 from walt.rm.model.lr.lr_model_v3 import LRRewardModelV3
+from walt.rm.model.lr.lr_model_v4 import LRRewardModelV4
 from walt.rm.model.lr.lr_model_v6 import LRRewardModelV6
+from walt.rm.model.lr.lr_model_v7 import LRRewardModelV7
 from walt.rm.model.schema_filter import SchemaFilteredRewardModel
 from walt.rm.model.tracking import log_run
 
 # "constant" needs no --rm-model file (ConstantRewardModel has no trainable state) —
 # combine with --schema-filter to test "first schema-valid LLM candidate, no learned
 # reranking at all" as a baseline against the real RM classes.
-RM_CLASS_CHOICES = ["lr_v3", "lr_v6", "distilbert", "constant"]
-RM_CLASS_BY_NAME = {"lr_v3": LRRewardModelV3, "lr_v6": LRRewardModelV6}
+RM_CLASS_CHOICES = ["lr_v3", "lr_v4", "lr_v6", "lr_v7", "distilbert", "constant"]
+RM_CLASS_BY_NAME = {"lr_v3": LRRewardModelV3, "lr_v4": LRRewardModelV4, "lr_v6": LRRewardModelV6, "lr_v7": LRRewardModelV7}
 from walt.utils.sql_exec import (
     ExecutionResult,
     capture_db_state,
@@ -126,7 +130,19 @@ def evaluate_agent(val_examples: list[Example], agent: SqlAgent) -> dict[str, An
     mixed_expected_random = 0.0
 
     print(f"Running agent over {len(executable)} executable val rows...")
+    progress_interval = 10  # a status line every N rows -- each involves n_candidates
+    # real LLM calls (Ollama or Claude) plus SQL execution, slow enough that silent
+    # per-row progress can look stuck on a large val set.
+    start = time.perf_counter()
     for i, ex in enumerate(executable, 1):
+        if i % progress_interval == 0 or i == len(executable):
+            elapsed = time.perf_counter() - start
+            rate_per_min = i / elapsed * 60 if elapsed > 0 else 0.0
+            eta_min = (len(executable) - i) / rate_per_min if rate_per_min > 0 else float("inf")
+            print(
+                f"  {i}/{len(executable)} rows ({100 * i / len(executable):.1f}%) | "
+                f"{rate_per_min:.1f} rows/min | elapsed {elapsed / 60:.1f}min | ETA ~{eta_min:.0f}min"
+            )
         try:
             result = agent.run(
                 ex.question,
@@ -237,6 +253,11 @@ def evaluate_agent(val_examples: list[Example], agent: SqlAgent) -> dict[str, An
 
 
 def main() -> None:
+    # Stdout is fully buffered by default when redirected to a file (e.g. a
+    # backgrounded run), so evaluate_agent's progress prints wouldn't be visible until
+    # the process exits without this — see build_severity_dataset.py's main().
+    sys.stdout.reconfigure(line_buffering=True)
+
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--input", type=Path, default=Path("data/output/rm_enhanced.jsonl"))
     parser.add_argument("--rm-model", type=Path, default=Path("data/output/rm_model.joblib"))
@@ -245,6 +266,7 @@ def main() -> None:
     parser.add_argument("--ollama-model", default="llama3.2", help="Model name when --llm-backend ollama")
     parser.add_argument("--claude-model", default="claude-haiku-4-5-20251001", help="Model name when --llm-backend claude (requires ANTHROPIC_API_KEY)")
     parser.add_argument("--n-candidates", type=int, default=5)
+    parser.add_argument("--ollama-concurrency", type=int, default=1, help="[--llm-backend ollama only] concurrent Ollama requests per row's candidate generation. Only helps once the Ollama server itself accepts concurrent requests (see build_severity_dataset.py docstring) — otherwise pure overhead.")
     parser.add_argument("--limit", type=int, default=None, help="Only evaluate the first N val rows (smoke testing)")
     parser.add_argument("--output", type=Path, default=None, help="Optional path to write the JSON summary")
     parser.add_argument("--llm-cache", type=Path, default=None, help="Cache LLM candidates here, keyed by (question, schema_context) — so re-running with a different --rm-model reuses candidates instead of re-calling the LLM. Defaults to data/output/llm_cache.json for --llm-backend ollama, data/output/llm_cache_claude.json for --llm-backend claude — separate files so switching backends never overwrites the other's cached candidates")
@@ -285,7 +307,7 @@ def main() -> None:
     else:
         default_cache_name = "llm_cache_claude.json" if args.llm_backend == "claude" else "llm_cache.json"
         llm_cache_path = Path("data/output") / default_cache_name
-    llm = build_llm(llm_model, llm_cache_path, backend=args.llm_backend)
+    llm = build_llm(llm_model, llm_cache_path, backend=args.llm_backend, ollama_concurrency=args.ollama_concurrency)
     agent = SqlAgent(llm=llm, rm=rm, n_candidates=args.n_candidates, strip_llm_context=args.strip_context)
     agent_metrics = evaluate_agent(val_examples, agent)
 

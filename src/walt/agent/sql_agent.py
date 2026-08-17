@@ -118,15 +118,20 @@ class SqlAgent:
         )
 
 
-def build_llm(model: str, llm_cache_path: str | Path | None, backend: str = "ollama") -> BaseLLM:
+def build_llm(
+    model: str, llm_cache_path: str | Path | None, backend: str = "ollama", ollama_concurrency: int = 1
+) -> BaseLLM:
     """backend selects the candidate-generating LLM: "ollama" (default, local
     OllamaLLM — model is e.g. "llama3.2") or "claude" (ClaudeLLM via the Anthropic API
-    — model is e.g. "claude-haiku-4-5-20251001", requires ANTHROPIC_API_KEY)."""
+    — model is e.g. "claude-haiku-4-5-20251001", requires ANTHROPIC_API_KEY).
+    ollama_concurrency is ignored for backend="claude" — see OllamaLLM's docstring for
+    why raising it only helps once the Ollama server itself accepts concurrent
+    requests."""
     llm: BaseLLM
     if backend == "claude":
         llm = ClaudeLLM(model=model)
     elif backend == "ollama":
-        llm = OllamaLLM(model=model)
+        llm = OllamaLLM(model=model, max_concurrency=ollama_concurrency)
     else:
         raise ValueError(f"Unknown llm backend: {backend!r} (expected 'ollama' or 'claude')")
     if llm_cache_path is not None:
@@ -146,10 +151,11 @@ def run_agent(
     n_candidates: int = 5,
     llm_cache_path: str | Path | None = "data/output/llm_cache.json",
     strip_llm_context: bool = False,
+    ollama_concurrency: int = 1,
 ) -> AgentResult:
     embedding_provider = SentenceTransformerEmbedding()
     rm = LRRewardModelV6.load(rm_model_path, embedding_provider=embedding_provider)
-    llm = build_llm(ollama_model, llm_cache_path, backend=llm_backend)
+    llm = build_llm(ollama_model, llm_cache_path, backend=llm_backend, ollama_concurrency=ollama_concurrency)
     agent = SqlAgent(llm=llm, rm=rm, n_candidates=n_candidates, strip_llm_context=strip_llm_context)
     return agent.run(question, schema_context, sql_context_clean=sql_context_clean, sql_context_path=sql_context_path)
 
@@ -163,6 +169,7 @@ def main() -> None:
     parser.add_argument("--rm-model", type=Path, default=Path("data/output/rm_model.joblib"))
     parser.add_argument("--ollama-model", default="llama3.2")
     parser.add_argument("--n-candidates", type=int, default=5)
+    parser.add_argument("--ollama-concurrency", type=int, default=1, help="Concurrent Ollama requests per row's candidate generation. Only helps once the Ollama server itself accepts concurrent requests (see build_severity_dataset.py docstring) — otherwise pure overhead.")
     parser.add_argument("--llm-cache", type=Path, default=Path("data/output/llm_cache.json"), help="Cache LLM candidates here, keyed by (question, schema_context) — reused across RM changes")
     parser.add_argument("--no-llm-cache", action="store_true", help="Always call the LLM fresh, ignoring/skipping the cache")
     parser.add_argument("--strip-context", action="store_true", help="Don't show the LLM schema_context when generating candidates (still used for execution) — tests unconditioned generation")
@@ -195,6 +202,7 @@ def main() -> None:
         n_candidates=args.n_candidates,
         llm_cache_path=None if args.no_llm_cache else args.llm_cache,
         strip_llm_context=args.strip_context,
+        ollama_concurrency=args.ollama_concurrency,
     )
     print(json.dumps(result.to_dict(), indent=2))
 

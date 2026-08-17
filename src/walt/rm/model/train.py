@@ -24,10 +24,19 @@ from walt.rm.model.distilbert_model import DEFAULT_MODEL_NAME as DISTILBERT_DEFA
 from walt.rm.model.distilbert_model import DistilBertRewardModel
 from walt.rm.model.embeddings import SentenceTransformerEmbedding
 from walt.rm.model.gbm_model import GBMRewardModel
-from walt.rm.model.lr import LRRewardModel, LRRewardModelV2, LRRewardModelV3, LRRewardModelV4, LRRewardModelV5, LRRewardModelV6
+from walt.rm.model.lr import (
+    LRRewardModel,
+    LRRewardModelV2,
+    LRRewardModelV3,
+    LRRewardModelV4,
+    LRRewardModelV5,
+    LRRewardModelV6,
+    LRRewardModelV7,
+)
+from walt.rm.model.lr.lr_model_v7 import EMBEDDING_DIFF_MODES
 from walt.rm.model.tracking import log_run
 
-MODEL_CHOICES = ["lr_v1", "lr_v2", "lr_v3", "lr_v4", "lr_v5", "lr_v6", "gbm", "distilbert"]
+MODEL_CHOICES = ["lr_v1", "lr_v2", "lr_v3", "lr_v4", "lr_v5", "lr_v6", "lr_v7", "gbm", "distilbert"]
 
 
 def main() -> None:
@@ -44,7 +53,8 @@ def main() -> None:
     parser.add_argument("--runs-dir", type=Path, default=Path("data/output/runs"), help="Directory where per-run metric records are logged for later comparison")
     parser.add_argument("--no-log-run", action="store_true", help="Skip writing a run record (e.g. for throwaway/debug runs)")
     parser.add_argument("--C", type=float, default=300.0, help="[lr_v1/lr_v2/.../lr_v6 only] LogisticRegression inverse regularization strength — 300 is CV-tuned for lr_v6 on gretel-only data (sklearn's own default is 1.0); other models/datasets were tuned separately, see CLAUDE.md")
-    parser.add_argument("--severity-zero-as-positive", action="store_true", help="[lr_v1/lr_v3/lr_v4/lr_v5/lr_v6 only] treat severity==0 sql_bad candidates (from enhance_severity_dataset.py) as extra positive anchors paired against every real bad, instead of excluding them from every pair. No-op on datasets without severity.")
+    parser.add_argument("--severity-zero-as-positive", action="store_true", help="[lr_v1/lr_v3/lr_v4/lr_v5/lr_v6/lr_v7 only] treat severity==0 sql_bad candidates (from enhance_severity_dataset.py) as extra positive anchors paired against every real bad, instead of excluding them from every pair. No-op on datasets without severity.")
+    parser.add_argument("--embedding-diff-mode", choices=EMBEDDING_DIFF_MODES, default="cosine", help="[lr_v7 only] how the commands/args-vs-question embedding comparison is folded into phi: 'cosine' (2 scalar cosine similarities) or 'raw' (2x768 raw vector differences)")
     parser.add_argument("--v2-cosine-sim", dest="v2_cosine_sim", action=argparse.BooleanOptionalAction, default=True, help="[lr_v2 only] include the cosine-similarity interaction feature")
     parser.add_argument("--v2-dot-product", dest="v2_dot_product", action=argparse.BooleanOptionalAction, default=True, help="[lr_v2 only] include the raw dot-product interaction feature")
     parser.add_argument("--v2-standardize-dot", dest="v2_standardize_dot", action=argparse.BooleanOptionalAction, default=True, help="[lr_v2 only] standardize the raw dot-product feature using training-set mean/std")
@@ -97,6 +107,14 @@ def main() -> None:
         model = LRRewardModelV5(embedding_provider=embedding_provider, seed=args.seed, C=args.C, severity_zero_as_positive=args.severity_zero_as_positive)
     elif args.model == "lr_v6":
         model = LRRewardModelV6(embedding_provider=embedding_provider, seed=args.seed, C=args.C, severity_zero_as_positive=args.severity_zero_as_positive)
+    elif args.model == "lr_v7":
+        model = LRRewardModelV7(
+            embedding_provider=embedding_provider,
+            seed=args.seed,
+            C=args.C,
+            severity_zero_as_positive=args.severity_zero_as_positive,
+            embedding_diff_mode=args.embedding_diff_mode,
+        )
     elif args.model == "distilbert":
         model = DistilBertRewardModel(
             model_name=args.distilbert_model_name,
@@ -168,12 +186,13 @@ def main() -> None:
                 "n_train": len(train_examples),
                 "n_test": len(test_examples),
                 **load_stats,  # n_rows_total, n_rows_skipped
-                **({"C": args.C} if args.model in ("lr_v1", "lr_v2", "lr_v3", "lr_v4", "lr_v5", "lr_v6") else {}),
+                **({"C": args.C} if args.model in ("lr_v1", "lr_v2", "lr_v3", "lr_v4", "lr_v5", "lr_v6", "lr_v7") else {}),
                 **(
                     {"severity_zero_as_positive": args.severity_zero_as_positive}
-                    if args.model in ("lr_v1", "lr_v3", "lr_v4", "lr_v5", "lr_v6")
+                    if args.model in ("lr_v1", "lr_v3", "lr_v4", "lr_v5", "lr_v6", "lr_v7")
                     else {}
                 ),
+                **({"embedding_diff_mode": args.embedding_diff_mode} if args.model == "lr_v7" else {}),
                 **(
                     {
                         "v2_cosine_sim": args.v2_cosine_sim,

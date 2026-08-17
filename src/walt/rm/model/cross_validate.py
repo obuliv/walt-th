@@ -19,6 +19,7 @@ from walt.rm.model.base import cross_validate, load_examples, publish_cv_summary
 from walt.rm.model.embeddings import SentenceTransformerEmbedding
 from walt.rm.model.gbm_model import GBMRewardModel
 from walt.rm.model.lr import (
+    EMBEDDING_DIFF_MODES,
     SCALING_CHOICES,
     SOLVER_BY_PENALTY,
     LRRewardModel,
@@ -28,10 +29,11 @@ from walt.rm.model.lr import (
     LRRewardModelV4,
     LRRewardModelV5,
     LRRewardModelV6,
+    LRRewardModelV7,
 )
 from walt.rm.model.tracking import log_run
 
-MODEL_CHOICES = ["lr_v1", "lr_v2", "lr_v3", "lr_v3_scaled", "lr_v4", "lr_v5", "lr_v6", "gbm"]
+MODEL_CHOICES = ["lr_v1", "lr_v2", "lr_v3", "lr_v3_scaled", "lr_v4", "lr_v5", "lr_v6", "lr_v7", "gbm"]
 
 
 def main() -> None:
@@ -46,7 +48,8 @@ def main() -> None:
     parser.add_argument("--C", type=float, default=300.0, help="[lr_v1/lr_v2/.../lr_v6 only] LogisticRegression inverse regularization strength — 300 is CV-tuned for lr_v6 on gretel-only data (sklearn's own default is 1.0); other models/datasets were tuned separately, see CLAUDE.md")
     parser.add_argument("--penalty", choices=sorted(SOLVER_BY_PENALTY), default="l2", help="[lr_v1/lr_v2/lr_v3/lr_v3_scaled only] LogisticRegression penalty type")
     parser.add_argument("--l1-ratio", type=float, default=None, help="[penalty=elasticnet only] elastic-net mixing parameter in [0,1] (0=l2, 1=l1)")
-    parser.add_argument("--severity-zero-as-positive", action="store_true", help="[lr_v1/lr_v3/lr_v4/lr_v5/lr_v6 only] treat severity==0 sql_bad candidates (from enhance_severity_dataset.py) as extra positive anchors paired against every real bad, instead of excluding them from every pair. No-op on datasets without severity — compare against the default (off) to A/B this.")
+    parser.add_argument("--severity-zero-as-positive", action="store_true", help="[lr_v1/lr_v3/lr_v4/lr_v5/lr_v6/lr_v7 only] treat severity==0 sql_bad candidates (from enhance_severity_dataset.py) as extra positive anchors paired against every real bad, instead of excluding them from every pair. No-op on datasets without severity — compare against the default (off) to A/B this.")
+    parser.add_argument("--embedding-diff-mode", choices=EMBEDDING_DIFF_MODES, default="cosine", help="[lr_v7 only] how the commands/args-vs-question embedding comparison is folded into phi: 'cosine' (2 scalar cosine similarities) or 'raw' (2x768 raw vector differences)")
     parser.add_argument("--v2-cosine-sim", dest="v2_cosine_sim", action=argparse.BooleanOptionalAction, default=True, help="[lr_v2 only]")
     parser.add_argument("--v2-dot-product", dest="v2_dot_product", action=argparse.BooleanOptionalAction, default=True, help="[lr_v2 only]")
     parser.add_argument("--v2-standardize-dot", dest="v2_standardize_dot", action=argparse.BooleanOptionalAction, default=True, help="[lr_v2 only]")
@@ -114,6 +117,12 @@ def main() -> None:
                 embedding_provider=embedding_provider, seed=args.seed, C=args.C, penalty=args.penalty,
                 l1_ratio=args.l1_ratio, severity_zero_as_positive=args.severity_zero_as_positive,
             )
+        if args.model == "lr_v7":
+            return LRRewardModelV7(
+                embedding_provider=embedding_provider, seed=args.seed, C=args.C, penalty=args.penalty,
+                l1_ratio=args.l1_ratio, severity_zero_as_positive=args.severity_zero_as_positive,
+                embedding_diff_mode=args.embedding_diff_mode,
+            )
         if args.model == "lr_v3_scaled":
             return LRRewardModelV3Scaled(
                 embedding_provider=embedding_provider,
@@ -156,7 +165,7 @@ def main() -> None:
                 "l1_ratio": args.l1_ratio,
                 **(
                     {"severity_zero_as_positive": args.severity_zero_as_positive}
-                    if args.model in ("lr_v1", "lr_v3", "lr_v4", "lr_v5", "lr_v6")
+                    if args.model in ("lr_v1", "lr_v3", "lr_v4", "lr_v5", "lr_v6", "lr_v7")
                     else {}
                 ),
                 **(
@@ -165,6 +174,7 @@ def main() -> None:
                     else {}
                 ),
                 **({"scaling": args.scaling} if args.model == "lr_v3_scaled" else {}),
+                **({"embedding_diff_mode": args.embedding_diff_mode} if args.model == "lr_v7" else {}),
                 **(
                     {"gbm_max_iter": args.gbm_max_iter, "gbm_max_depth": args.gbm_max_depth, "gbm_learning_rate": args.gbm_learning_rate}
                     if args.model == "gbm"
